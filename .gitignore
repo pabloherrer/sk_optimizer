@@ -1,0 +1,26 @@
+# Virtual environments — never commit these
+sk_venv/
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated outputs — too large / regenerated each run
+output/
+
+# Temp Excel lock files
+~$*.xlsx
+
+# Runtime state
+data/inventory_state.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Secrets / local overrides (if added later)
+.env

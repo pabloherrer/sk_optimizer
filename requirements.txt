@@ -1,0 +1,11 @@
+# S&K Route Optimizer — Python dependencies
+# Pinned to exact working versions — do not change without testing.
+# Install with:  pip install -r requirements.txt
+
+flask==3.1.1
+openpyxl==3.1.5
+pandas==2.3.3
+numpy==2.2.6
+folium==0.20.0
+ortools==9.15.6755
+requests==2.33.1
