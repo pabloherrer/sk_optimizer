@@ -200,52 +200,45 @@ def save_run_summary(excel_file: str | None, map_file: str | None, elapsed_sec: 
         'urgency':       {'critical': 0, 'urgent': 0, 'normal': 0},
     }
 
-    # Parse output Excel for route stats
+    # Parse output Excel for route stats using the Week_Summary sheet
     if excel_file:
         excel_path = OUTPUT_DIR / excel_file
         if excel_path.exists():
             try:
                 from openpyxl import load_workbook
                 wb = load_workbook(excel_path, read_only=True, data_only=True)
-                for sheet_name in wb.sheetnames:
-                    ws = wb[sheet_name]
-                    rows = list(ws.iter_rows(values_only=True))
-                    if len(rows) < 2:
-                        continue
-                    headers   = [str(c or '').lower() for c in rows[0]]
-                    data_rows = [r for r in rows[1:] if any(c is not None for c in r)]
-                    if not data_rows:
-                        continue
-                    summary['routes_count'] += 1
-                    summary['total_stops']  += len(data_rows)
 
-                    # Try to find and sum miles
-                    miles_col = next(
-                        (i for i, h in enumerate(headers)
-                         if 'mile' in h or ('dist' in h and 'km' not in h)),
-                        None
-                    )
-                    if miles_col is not None:
-                        total = sum(
-                            r[miles_col] for r in data_rows
-                            if isinstance(r[miles_col], (int, float))
-                        )
-                        if summary['total_miles'] is None:
-                            summary['total_miles'] = 0
-                        summary['total_miles'] += total
+                # 1_Week_Summary has one row per truck-day route
+                if '1_Week_Summary' in wb.sheetnames:
+                    ws      = wb['1_Week_Summary']
+                    rows    = list(ws.iter_rows(values_only=True))
+                    if rows:
+                        headers   = [str(c or '').lower() for c in rows[0]]
+                        data_rows = [r for r in rows[1:] if any(c is not None for c in r)]
 
-                    # Try to find deferred clients
-                    defer_col = next(
-                        (i for i, h in enumerate(headers) if 'defer' in h or 'skip' in h),
-                        None
-                    )
-                    if defer_col is not None:
-                        summary['deferred_count'] += sum(
-                            1 for r in data_rows if r[defer_col]
-                        )
+                        stops_col = next((i for i, h in enumerate(headers) if h == 'stops'), None)
+                        miles_col = next((i for i, h in enumerate(headers) if h == 'dist_mi'), None)
+
+                        summary['routes_count'] = len(data_rows)
+                        if stops_col is not None:
+                            summary['total_stops'] = sum(
+                                r[stops_col] for r in data_rows
+                                if isinstance(r[stops_col], (int, float))
+                            )
+                        if miles_col is not None:
+                            summary['total_miles'] = round(sum(
+                                r[miles_col] for r in data_rows
+                                if isinstance(r[miles_col], (int, float))
+                            ), 1)
+
+                # Deferred sheet has one row per unserved client
+                if 'Deferred' in wb.sheetnames:
+                    ws    = wb['Deferred']
+                    drows = list(ws.iter_rows(values_only=True))
+                    # subtract 1 for header row
+                    summary['deferred_count'] = max(0, len(drows) - 1)
+
                 wb.close()
-                if summary['total_miles'] is not None:
-                    summary['total_miles'] = round(summary['total_miles'], 1)
             except Exception:
                 pass
 
