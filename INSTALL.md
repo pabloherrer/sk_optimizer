@@ -16,17 +16,25 @@
 4. **IMPORTANT:** On the first screen, check the box **"Add Python to PATH"**
 5. Click "Install Now" and let it finish
 
-### Step 2 — Copy the optimizer folder to this computer
-Copy the entire `sk_optimizer` folder anywhere you like.  
-Suggested location: `C:\Users\[YourName]\Desktop\sk_optimizer`
+### Step 2 — Install Git
+1. Go to **https://git-scm.com/download/win**
+2. Download and run the installer (all defaults are fine)
 
-### Step 3 — Run Setup (one time only)
-1. Open the `sk_optimizer` folder
+## Step 3 — Download the optimizer
+1. Open Command Prompt (search "cmd" in Start menu)
+2. Run this command:
+```
+git clone https://github.com/pabloherrer/sk_optimizer.git C:\sk_optimizer
+```
+This downloads everything into `C:\sk_optimizer`.
+
+### Step 4 — Run Setup (one time only)
+1. Open the `C:\sk_optimizer` folder
 2. Double-click **`setup.bat`**
 3. A black window will appear and install everything automatically
 4. Takes about 2–3 minutes. When done it says "Setup complete!"
 
-### Step 4 — Launch
+### Step 5 — Launch
 Double-click **`Launch Optimizer.bat`** every time you want to run it.  
 Your browser will open automatically at `http://localhost:5050`.
 

@@ -25,9 +25,10 @@ if %errorlevel% neq 0 (
 )
 
 :: ── Pull latest version ───────────────────────────
-echo Downloading latest version...
+echo Downloading latest version from GitHub...
+echo   https://github.com/pabloherrer/sk_optimizer
 echo.
-git pull
+git pull https://github.com/pabloherrer/sk_optimizer.git
 if %errorlevel% neq 0 (
     echo.
     echo Update failed. Check your internet connection.
