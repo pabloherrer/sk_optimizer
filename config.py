@@ -46,8 +46,17 @@ NUM_TRUCKS  = len(TRUCK_NAMES)
 DAYS     = ['Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 NUM_DAYS = len(DAYS)
 
-SHIFT_MIN    = 600   # Hard shift cap: 10 hours (minutes) — 6 AM to 4 PM
-OVERTIME_MIN = 480   # Soft cap: target return 2 PM (8 hours); penalise above this
+SHIFT_MIN     = 600   # Soft shift cap: 10 hours (minutes). Beyond this is overtime.
+MAX_SHIFT_MIN = 720   # Hard driver-hours ceiling: 12 hours (minutes). Routes cannot exceed this.
+OVERTIME_MIN  = 480   # Early soft cap: target return 2 PM (8 hours); penalise above this
+
+# ── Overtime cost model ──────────────────────────────────────────────────────
+# Shift time beyond SHIFT_MIN is legal but billed 1.5x. The objective adds an
+# overtime cost to let the solver trade OT minutes against marginal revenue
+# from an extra stop. Expressed in the same integer cost units as distance.
+OT_MULTIPLIER        = 1.5    # 1.5x base labor rate for minutes over SHIFT_MIN
+LABOR_COST_PER_MIN   = 50     # Base labor cost units per minute (≈ $30/hr driver → 50 units/min)
+OT_PENALTY_PER_MIN   = int(LABOR_COST_PER_MIN * (OT_MULTIPLIER - 1.0))  # = 25: the *extra* cost per OT minute
 
 # ── Inventory thresholds ──────────────────────────────────────────────────────
 MIN_OIL_PCT      = 0.00   # 0 % floor — stockout protection handled by scheduler urgency
@@ -57,6 +66,42 @@ PREFERRED_FILL_PCT = 0.85 # Preferred floor: optimizer scores higher-fill delive
 SOFT_MIN_FILL_PCT = 0.60  # Soft gate: clients below 60 % fill get discounted score only
 CRITICAL_DAYS = 1.5    # Stockout within 1.5 days → mandatory visit today
 URGENT_DAYS   = 4.0    # Stockout within 4 days   → high-priority
+
+# ── Contractual service cadence (from Aksen et al. 2012 SIRP formulation) ────
+# Customer contract caps the gap between two successive visits. Any client
+# whose last visit would be older than MAX_SERVICE_INTERVAL_DAYS by the END
+# of the planning window is elevated to mandatory ("must serve this week")
+# regardless of current tank level. This plugs the gap the audit flagged:
+# the previous model had no hard upper bound on visit spacing — only urgency
+# penalties keyed to stockout — so a client on vacation could quietly slip
+# past the 14-day contractual limit.
+MAX_SERVICE_INTERVAL_DAYS = 14
+
+# ── Profit-weighted objective (Cornillier, Boctor, Laporte & Renaud 2009) ────
+# PSRPTW frames routing as profit = revenue(lbs delivered) − cost(miles + time).
+# We implement a scalar proxy: the drop-penalty of each client is multiplied
+# by (1 + EFFICIENCY_WEIGHT × Fill_Pct_At_Visit). A nearly-full tank gets a
+# larger drop-penalty (more revenue at stake); a low-fill tank gets less.
+# The net effect is that the solver prefers dense, high-fill routes over
+# low-fill scatter — which matches S&K's business goal (route density +
+# tank efficiency) without abandoning distance minimization.
+# 0.0 = pure distance-min (legacy).  1.5 = strongly efficiency-weighted.
+EFFICIENCY_WEIGHT = 1.5
+
+# ── Time windows enforcement (Cornillier PSRPTW) ──────────────────────────────
+# The codebase already loads time_windows_df but never applies it to the
+# solver's Time dimension. Flip this to True to activate per-node CumulVar
+# bounds on the ~12 clients with morning-only / after-2-PM windows.
+ENFORCE_TIME_WINDOWS = True
+
+# ── Forward-projected refills (Coelho-Cordeau-Laporte 2014) ──────────────────
+# True  → solver sizes per-client refill using the *end-of-week* projection
+#          (refills_by_day[NUM_DAYS-1]). Any client visited on Day 4 must carry
+#          the Day-4 refill amount, so this keeps feasibility conservative.
+# False → solver sizes each refill from *today's* snapshot. Faster/simpler,
+#          but risks under-provisioning trucks for late-week stops.
+# Toggleable for A/B benchmarking; production defaults to True.
+USE_FORWARD_REFILLS = True
 
 # ── Opportunistic fill ───────────────────────────────────────────────────────
 # After the EDF assigns "must serve" clients to each day, sweep the route for
@@ -146,17 +191,18 @@ TRUCK_SPEED_FACTOR = 1.25
 # Tucson & Flagstaff are on a separate bi-weekly Saturday run.
 # These clients are excluded from the weekly optimizer entirely.
 EXCLUDED_CLIENT_IDS: set = {
-    # Flagstaff area (lat ~35.x)
-    'C057',   # Karma Sushi Bar & Grill
-    'C164',   # Lotus Lounge
-    'C166',   # Oregano Country
-    'C169',   # Oregano Flagstaff
-    # Tucson area (lat ~32.x)
-    'C158',   # Angry Crab Tucson
-    'C163',   # Jay Travel Center
-    'C167',   # Oregano Landing
-    'C168',   # Oregano Tucson
-    'C170',   # Oregano Speedway
+    # Flagstaff area (lat ~35.x) — bi-weekly Saturday run
+    '11005',  # Karma Sushi
+    '12021',  # Lotus Lounge
+    '15032',  # Oregano Country
+    '15004',  # Oregano Flagstaff
+    # Tucson / Casa Grande area (lat ~32.x) — bi-weekly Saturday run
+    '1057',   # Angry Crab Tucson
+    '10012',  # Jay Travel Center
+    '15033',  # Oregano Landing
+    '15028',  # Oregano Tucson
+    '15021',  # Oregano Speedway
+    '16027',  # Pirate Casa Grande
 }
 
 # ── Consumption estimation ────────────────────────────────────────────────────

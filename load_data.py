@@ -62,12 +62,17 @@ def load_clients(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
 
     records = []
     for row in ws.iter_rows(min_row=4, values_only=True):
-        # Skip blank or non-client rows
-        if not row[0] or not str(row[0]).startswith('C'):
+        # Skip blank rows and the header row (col A = 'ID')
+        if not row[0]:
+            continue
+        if str(row[0]).strip().upper() == 'ID':
+            continue
+        # Skip rows with no customer name
+        if not row[1]:
             continue
 
         records.append({
-            'ID':       str(row[0]).strip(),
+            'ID':       str(int(row[0])) if isinstance(row[0], float) else str(row[0]).strip(),
             'Customer': str(row[1]).strip() if row[1] else '',
             'Zone':     str(row[2]).replace('.0', '').strip() if row[2] else '',
             'Zone_Code':str(row[3]).strip() if row[3] else '',
@@ -82,6 +87,13 @@ def load_clients(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(records)
+
+    # Remove duplicate IDs — keep first occurrence (sheet order = canonical)
+    dupes = df[df.duplicated('ID', keep=False)]
+    if len(dupes):
+        dup_ids = dupes['ID'].unique().tolist()
+        print(f"  ⚠  Duplicate ID(s) in Client_List, keeping first occurrence: {dup_ids}")
+        df = df.drop_duplicates(subset='ID', keep='first')
 
     # Normalise product names to canonical values
     df['Product'] = df['Product'].str.upper().str.strip().map(

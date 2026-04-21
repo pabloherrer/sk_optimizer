@@ -38,11 +38,15 @@ from ortools.constraint_solver import routing_enums_pb2, pywrapcp
 
 from config import (
     DAYS, NUM_DAYS, TRUCKS, TRUCK_NAMES, NUM_TRUCKS,
-    SHIFT_MIN, SOLVE_SEC_WEEK,
+    SHIFT_MIN, MAX_SHIFT_MIN, OT_PENALTY_PER_MIN, OT_MULTIPLIER,
+    LABOR_COST_PER_MIN, SOLVE_SEC_WEEK,
     OPPORTUNISTIC_FILL_PCT, CRITICAL_DAYS, URGENT_DAYS,
     METERS_PER_MILE, PRODUCTS, COMPARTMENT_CAPACITY_LBS,
     DEPOT_LAT, DEPOT_LON, EXCLUDED_CLIENT_IDS,
+    MAX_SERVICE_INTERVAL_DAYS, EFFICIENCY_WEIGHT, ENFORCE_TIME_WINDOWS,
+    USE_FORWARD_REFILLS,
 )
+import config as _cfg
 from inventory import (
     compute_refill, fill_efficiency, days_until_stockout,
     project_level, urgency_tier,
@@ -440,10 +444,22 @@ def solve_week(
     sub_dist = dist_matrix[np.ix_(midx, midx)].astype(np.int64)
     sub_time = time_matrix_min[np.ix_(midx, midx)].astype(np.int64)
 
-    # Per-node refill from today's snapshot — used by solver capacity/time
-    # callbacks. Day-projected refills (refills_by_day) drive urgency penalties
-    # and display output only, keeping the solver's feasibility space intact.
-    refills = [0] + pool['Refill_lbs'].astype(int).tolist()
+    # Per-node refill used by solver capacity/time callbacks.
+    # Uses end-of-week projected refill (most depleted across the planning
+    # horizon) as a conservative upper bound. This follows the inventory-routing
+    # tradition (Coelho-Cordeau-Laporte 2014, "Thirty Years of Inventory
+    # Routing") of sizing capacity against projected demand, not today's
+    # snapshot. Rationale: if a client is visited on Day 4 of the plan, the
+    # truck must physically carry the Day-4 refill amount, not today's — and a
+    # snapshot-sized solver will under-provision capacity for late-week stops.
+    # Using the end-of-week value keeps the feasibility space conservative
+    # (any earlier day needs less) and service time realistic.
+    # When USE_FORWARD_REFILLS=False (legacy/benchmark A/B), size from Day 0
+    # snapshot instead — risks late-week under-provisioning.
+    if getattr(_cfg, 'USE_FORWARD_REFILLS', True):
+        refills = list(refills_by_day[NUM_DAYS - 1])
+    else:
+        refills = list(refills_by_day[0])
 
     # ── Step 3: OR-Tools model ───────────────────────────────────────────
     manager = pywrapcp.RoutingIndexManager(
@@ -509,11 +525,93 @@ def solve_week(
 
     routing.AddDimensionWithVehicleTransits(
         time_cb_indices,
-        0,             # no slack
-        SHIFT_MIN,     # max cumulative time per vehicle
-        True,          # start cumul at zero
+        0,               # no slack
+        MAX_SHIFT_MIN,   # HARD driver-hours ceiling (12 hr)
+        True,            # start cumul at zero
         'Time',
     )
+
+    # ── Overtime model ──────────────────────────────────────────────────────
+    # Minutes beyond SHIFT_MIN are legal (up to MAX_SHIFT_MIN) but cost extra.
+    # SetCumulVarSoftUpperBound adds `coef × max(0, CumulVar - soft)` to the
+    # objective, exactly matching "pay 1.5× for minutes over shift".
+    # Read OT penalty dynamically from config so A/B benchmarks can override.
+    ot_penalty_dynamic = int(
+        getattr(_cfg, 'LABOR_COST_PER_MIN', LABOR_COST_PER_MIN)
+        * (getattr(_cfg, 'OT_MULTIPLIER', OT_MULTIPLIER) - 1.0)
+    )
+    if ot_penalty_dynamic > 0:
+        time_dim_for_ot = routing.GetDimensionOrDie('Time')
+        for v in range(n_vehicles):
+            end_idx = routing.End(v)
+            time_dim_for_ot.SetCumulVarSoftUpperBound(end_idx, SHIFT_MIN, ot_penalty_dynamic)
+
+    # ── Per-client time windows (Cornillier, Boctor, Laporte & Renaud 2009 PSRPTW) ──
+    # Apply CumulVar bounds on the Time dimension for any client with hours
+    # listed in time_windows_df. Minutes-since-midnight in the sheet are
+    # rebased to minutes-since-shift-start, matching the Time dimension which
+    # starts at cumul 0 when the truck leaves the depot.
+    #
+    # Clients with windows only on specific week-days also get vehicle-var
+    # restrictions: vehicles on days NOT listed in the client's window set are
+    # forbidden. This is how we express "Client X is morning-only on Tue/Thu,
+    # don't even try scheduling them on Wed".
+    _enforce_tw = bool(getattr(_cfg, 'ENFORCE_TIME_WINDOWS', ENFORCE_TIME_WINDOWS))
+    if _enforce_tw and time_windows_df is not None and not time_windows_df.empty:
+        time_dim = routing.GetDimensionOrDie('Time')
+        shift_start = int(depot_config.get('shift_start_min', 6 * 60))
+
+        # Build a fast lookup: client_id -> list of (day_index, open_min_rel, close_min_rel)
+        # where *_rel is rebased against shift_start.
+        tw_by_client: Dict[str, List[Tuple[int, int, int]]] = {}
+        for _, tw_row in time_windows_df.iterrows():
+            cid   = tw_row.get('Client_ID')
+            dname = str(tw_row.get('Day_of_Week', '')).strip()
+            try:
+                open_abs  = int(tw_row.get('Open_Min'))
+                close_abs = int(tw_row.get('Close_Min'))
+            except (TypeError, ValueError):
+                continue
+            if dname not in DAYS:
+                continue
+            d_idx = DAYS.index(dname)
+            open_rel  = max(0, open_abs  - shift_start)
+            close_rel = max(0, close_abs - shift_start)
+            if close_rel <= open_rel:
+                continue
+            tw_by_client.setdefault(cid, []).append((d_idx, open_rel, close_rel))
+
+        n_tw_applied = 0
+        n_day_restricted = 0
+        pool_ids = pool['ID'].tolist()
+        id_to_pool_idx = {cid: i for i, cid in enumerate(pool_ids)}
+
+        for cid, windows in tw_by_client.items():
+            if cid not in id_to_pool_idx:
+                continue   # client not in this week's pool — skip
+            pool_i = id_to_pool_idx[cid]
+            ni     = manager.NodeToIndex(pool_i + 1)   # +1 because depot is 0
+
+            # Union envelope: widest open, narrowest close across this client's
+            # days. This is conservative: a visit will satisfy the union
+            # envelope AND the per-day vehicle restriction together.
+            widest_open   = min(w[1] for w in windows)
+            narrowest_close = max(w[2] for w in windows)
+            time_dim.CumulVar(ni).SetRange(int(widest_open), int(narrowest_close))
+            n_tw_applied += 1
+
+            # Forbid vehicles whose day-index isn't in the client's window set.
+            allowed_days = {w[0] for w in windows}
+            if len(allowed_days) < NUM_DAYS:
+                for v in range(n_vehicles):
+                    _, day_idx, _ = vehicle_to_truck_day_config(v)
+                    if day_idx not in allowed_days:
+                        routing.VehicleVar(ni).RemoveValue(v)
+                n_day_restricted += 1
+
+        if n_tw_applied:
+            print(f"\n  Time windows: applied to {n_tw_applied} client(s) "
+                  f"({n_day_restricted} with day-restrictions)")
 
     # ── Total-capacity dimension (truck physical cap = 10,000 lbs) ───────
     def _demand_cb(from_idx):
@@ -583,25 +681,81 @@ def solve_week(
     #
     # Use the WORST-CASE urgency across all days: a client that's fine today
     # but hits stockout by Day 4 must still be served.
+    #
+    # Two paper-driven amplifications on the base penalty:
+    #   1. Contractual service cadence (Aksen, Kaya, Salman & Akça 2012 —
+    #      Selective & Periodic IRP): if the gap since last delivery would
+    #      exceed MAX_SERVICE_INTERVAL_DAYS by the end of the planning window,
+    #      escalate to stockout tier regardless of tank level. Plugs the gap
+    #      the audit found: prior model had no hard upper bound on visit
+    #      spacing — a client "on vacation" could silently slip past 14 days.
+    #   2. Profit / fill weighting (Cornillier, Boctor, Laporte & Renaud 2009
+    #      PSRPTW, Archetti et al. TOP-IRP): multiply the penalty by
+    #      (1 + EFFICIENCY_WEIGHT × fill_pct_at_visit). A near-full tank has
+    #      more revenue at stake than a half-empty one, so dropping it costs
+    #      more. Net effect: solver prefers dense, high-fill routes without
+    #      abandoning distance minimisation.
+    #
+    # `Last_Date` (days-since-last-delivery) comes from forecast_consumption.
+    # Clients with no prior delivery history get FALLBACK_DAYS_SINCE applied
+    # there, so `Days_Since_Last` / `Days_Since_Used` is always populated.
+    pool_idx_to_days_since: Dict[int, float] = {}
+    if 'Days_Since_Last' in pool.columns or 'Days_Since_Used' in pool.columns:
+        for i in range(n_clients):
+            row = pool.iloc[i]
+            dsl = row.get('Days_Since_Used', row.get('Days_Since_Last'))
+            try:
+                pool_idx_to_days_since[i] = float(dsl) if pd.notna(dsl) else 0.0
+            except (TypeError, ValueError):
+                pool_idx_to_days_since[i] = 0.0
+
+    n_contract = 0
     for i in range(n_clients):
         ni  = manager.NodeToIndex(i + 1)      # +1 because depot is 0
         far = client_is_far[i]
 
         # Worst-case days-to-empty across the planning window
         worst_dte = min(dte_by_day[d][i + 1] for d in range(NUM_DAYS))
-        worst_urg = urgency_tier(worst_dte)
 
-        if worst_dte <= 1:
-            penalty = 10_000_000      # Stockout — essentially mandatory (forces trip)
+        # Best (= highest) projected fill across the week — this is what the
+        # truck would actually deliver at the best-case visit day for revenue.
+        tank_lbs = max(float(pool.iloc[i]['Tank_lbs']), 1.0)
+        best_fill_pct = max(
+            (refills_by_day[d][i + 1] / tank_lbs) for d in range(NUM_DAYS)
+        )
+        best_fill_pct = min(max(best_fill_pct, 0.0), 1.0)
+
+        # Contract escalation: will the client exceed MAX_SERVICE_INTERVAL_DAYS
+        # by the end of the planning window? If so, treat as mandatory.
+        # Read dynamically so A/B benchmarks can toggle contract enforcement.
+        _max_gap = getattr(_cfg, 'MAX_SERVICE_INTERVAL_DAYS', MAX_SERVICE_INTERVAL_DAYS)
+        days_since = pool_idx_to_days_since.get(i, 0.0)
+        contract_overdue_by_eow = (
+            days_since + NUM_DAYS >= _max_gap
+        )
+
+        if worst_dte <= 1 or contract_overdue_by_eow:
+            base_penalty = 10_000_000  # Stockout or contract-overdue → mandatory
+            if contract_overdue_by_eow and worst_dte > 1:
+                n_contract += 1
         elif worst_dte <= 5:
-            penalty = 2_000_000       # Urgent — strongly prefer to serve
+            base_penalty = 2_000_000   # Urgent — strongly prefer to serve
         elif far:
-            penalty = 150_000         # Normal far — cheap to skip solo
-                                      # (solver only goes if grouped with siblings)
+            base_penalty = 150_000     # Normal far — cheap to skip solo
         else:
-            penalty = 1_500_000       # Normal metro — don't chase single stops
+            base_penalty = 1_500_000   # Normal metro — don't chase single stops
+
+        # Fill-efficiency amplifier: a higher-fill stop is worth more dropped-
+        # revenue, so dropping it costs the solver more. Scales base by up to
+        # (1 + EFFICIENCY_WEIGHT) at fill=100%; by 1.0 at fill=0%.
+        _eff_w = float(getattr(_cfg, 'EFFICIENCY_WEIGHT', EFFICIENCY_WEIGHT))
+        penalty = int(round(base_penalty * (1.0 + _eff_w * best_fill_pct)))
 
         routing.AddDisjunction([ni], penalty)
+
+    if n_contract:
+        print(f"  Contractual cadence: {n_contract} client(s) elevated to "
+              f"mandatory (>{MAX_SERVICE_INTERVAL_DAYS}-day interval)")
 
     # ── Urgency → early-day hard constraint ────────────────────────────
     # Only clients already IN STOCKOUT today (DTE ≤ 0) get a hard "must
@@ -780,10 +934,22 @@ def _build_pool(
 
     # Eligibility: include anyone who will need service within the week.
     # Either they already need ≥50% fill today, OR they'll hit stockout
-    # within 7 days (matching the notebook's VISIT_WINDOW approach).
+    # within 7 days (matching the notebook's VISIT_WINDOW approach), OR
+    # their contractual cadence would be violated by end of week (Aksen 2012).
+    # The third clause closes the pool-filter gap: without it, a client with
+    # Days_Since_Last=13 and a near-full tank gets dropped before the solver
+    # can honor the contract.
+    contract_due = pd.Series(False, index=df.index)
+    _max_gap = getattr(_cfg, 'MAX_SERVICE_INTERVAL_DAYS', MAX_SERVICE_INTERVAL_DAYS)
+    if 'Days_Since_Last' in df.columns or 'Days_Since_Used' in df.columns:
+        dsl = df.get('Days_Since_Used', df.get('Days_Since_Last'))
+        if dsl is not None:
+            contract_due = pd.to_numeric(dsl, errors='coerce').fillna(0) + NUM_DAYS \
+                           >= _max_gap
     eligible = (
         (df['Fill_Pct'] >= OPPORTUNISTIC_FILL_PCT)
         | (df['Days_Until_Stockout'] <= 7)
+        | contract_due
     )
 
     # ── Far-cluster sweep: if ANY client in a distant city qualifies,
@@ -908,17 +1074,20 @@ def _extract_routes(
                 travel_m   = int(sub_dist[prev_node, model_node])
                 travel_min = int(sub_time[prev_node, model_node])
 
-                # Snapshot refill (capacity-checked by solver) for load totals
-                refill = int(pool_row['Refill_lbs'])
-                svc_min    = setup + math.ceil(refill / rate)
-
-                # Day-projected urgency / DTE for prioritisation display
+                # Day-projected refill / urgency / DTE at actual visit day.
+                # Display matches what the driver will physically pump: tank
+                # level has depleted further by the time the route runs, so the
+                # Day-d projection is the accurate number (not today's snapshot).
                 if refills_by_day and day < len(refills_by_day):
-                    dte = dte_by_day[day][model_node]
-                    urg = urgency_by_day[day][model_node]
+                    refill = int(refills_by_day[day][model_node])
+                    dte    = dte_by_day[day][model_node]
+                    urg    = urgency_by_day[day][model_node]
                 else:
-                    dte = float(meta_row['days_to_empty'])
-                    urg = meta_row['urgency']
+                    refill = int(pool_row['Refill_lbs'])
+                    dte    = float(meta_row['days_to_empty'])
+                    urg    = meta_row['urgency']
+
+                svc_min = setup + math.ceil(refill / rate)
 
                 cum_dist  += travel_m
                 cum_time  += travel_min + svc_min
@@ -993,9 +1162,20 @@ def _extract_routes(
 
         compartments = _assign_compartments_by_config(product_lbs, cfg)
 
+        # Overtime accounting: minutes beyond SHIFT_MIN are OT, billed 1.5x.
+        # Read dynamic values so A/B benchmarks that mutate cfg get accurate numbers.
+        _base_labor = getattr(_cfg, 'LABOR_COST_PER_MIN', LABOR_COST_PER_MIN)
+        _ot_mult    = getattr(_cfg, 'OT_MULTIPLIER', OT_MULTIPLIER)
+        reg_min = min(cum_time, SHIFT_MIN)
+        ot_min  = max(cum_time - SHIFT_MIN, 0)
+        labor_cost = reg_min * _base_labor + ot_min * _base_labor * _ot_mult
+
         for rec in route_stops:
             rec['Route_Dist_mi']    = round(cum_dist / METERS_PER_MILE, 1)
             rec['Route_Time_min']   = cum_time
+            rec['Reg_Min']          = reg_min
+            rec['OT_Min']           = ot_min
+            rec['Labor_Cost']       = labor_cost
             rec['Shift_Pct']        = round(cum_time / SHIFT_MIN * 100, 1)
             rec['Return_Depot_Min'] = ret_min
             rec['Route_Load_lbs']   = route_load
