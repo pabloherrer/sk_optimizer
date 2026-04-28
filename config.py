@@ -6,7 +6,7 @@ nothing else in the codebase needs to be edited for routine tuning.
 """
 
 from pathlib import Path
-import sys, os
+import sys, os, json
 
 # ── Force UTF-8 on Windows (prevents CP1252 crash with Unicode chars) ────────
 if sys.platform == 'win32':
@@ -23,7 +23,25 @@ BASE_DIR   = Path(__file__).parent
 DATA_DIR   = BASE_DIR / 'data'
 OUTPUT_DIR = BASE_DIR / 'output'
 
-INPUT_FILE  = DATA_DIR / 'SK_Delivery_System.xlsx'
+# ── Per-machine settings (local_config.json — gitignored) ────────────────────
+LOCAL_CONFIG_FILE = BASE_DIR / 'local_config.json'
+_local_cfg = {}
+if LOCAL_CONFIG_FILE.exists():
+    try:
+        _local_cfg = json.loads(LOCAL_CONFIG_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+
+def save_local_config(cfg: dict):
+    """Write per-machine settings that persist across updates."""
+    LOCAL_CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+
+# SK_INPUT_FILE: env var → local_config.json → default
+INPUT_FILE = Path(
+    os.environ.get('SK_INPUT_FILE')
+    or _local_cfg.get('input_file')
+    or str(DATA_DIR / 'SK_Delivery_System.xlsx')
+)
 MATRIX_FILE = DATA_DIR / 'osrm_full_matrix_with_ids.npz'
 NODES_FILE  = DATA_DIR / 'osrm_nodes_used_with_ids.csv'
 STATE_FILE  = DATA_DIR / 'inventory_state.json'

@@ -32,9 +32,19 @@ except ImportError:
 
 BASE_DIR     = Path(__file__).parent
 OUTPUT_DIR   = BASE_DIR / 'output'
-INPUT_FILE   = Path(os.environ.get('SK_INPUT_FILE',
-               str(BASE_DIR / 'data' / 'SK_Delivery_System.xlsx')))
 SUMMARY_FILE = OUTPUT_DIR / 'last_run_summary.json'
+
+# Input file: env var → local_config.json → default
+_default_input = str(BASE_DIR / 'data' / 'SK_Delivery_System.xlsx')
+_local_cfg_path = BASE_DIR / 'local_config.json'
+_local_input = None
+if _local_cfg_path.exists():
+    try:
+        import json as _j
+        _local_input = _j.loads(_local_cfg_path.read_text(encoding='utf-8')).get('input_file')
+    except Exception:
+        pass
+INPUT_FILE = Path(os.environ.get('SK_INPUT_FILE') or _local_input or _default_input)
 
 # Import thresholds from config — never hardcode these
 sys.path.insert(0, str(BASE_DIR))
@@ -422,6 +432,42 @@ def view_map(filename):
 def status():
     outputs = get_latest_outputs()
     return jsonify({'running': _is_running, **outputs})
+
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings_route():
+    """Get or save per-machine settings (persists in local_config.json)."""
+    from config import LOCAL_CONFIG_FILE, save_local_config
+    if request.method == 'GET':
+        cfg = {}
+        if LOCAL_CONFIG_FILE.exists():
+            try:
+                cfg = json.loads(LOCAL_CONFIG_FILE.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        cfg.setdefault('input_file', str(INPUT_FILE))
+        return jsonify(cfg)
+    else:
+        data = request.json or {}
+        new_path = data.get('input_file', '').strip()
+        if not new_path:
+            return jsonify({'error': 'No path provided'}), 400
+        p = Path(new_path)
+        if not p.exists():
+            return jsonify({'error': f'File not found: {new_path}'}), 400
+        if not str(p).lower().endswith('.xlsx'):
+            return jsonify({'error': 'File must be an .xlsx file'}), 400
+        # Save to local_config.json
+        cfg = {}
+        if LOCAL_CONFIG_FILE.exists():
+            try:
+                cfg = json.loads(LOCAL_CONFIG_FILE.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        cfg['input_file'] = str(p)
+        save_local_config(cfg)
+        return jsonify({'ok': True, 'input_file': str(p),
+                        'note': 'Restart the app for the new path to take effect.'})
 
 
 @app.route('/snapshot')
@@ -1059,6 +1105,108 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     animation: spin 0.7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Settings Modal ── */
+  .settings-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 15px;
+    color: #94a3b8;
+    padding: 2px 6px;
+    border-radius: 6px;
+    transition: all 0.15s;
+    margin-left: auto;
+  }
+  .settings-btn:hover { background: #f1f5f9; color: #1a6faf; }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.35);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+  }
+  .modal-overlay.open { opacity: 1; pointer-events: auto; }
+  .modal-box {
+    background: #fff;
+    border-radius: 14px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.18);
+    width: 520px;
+    max-width: 92vw;
+    padding: 28px 30px 24px;
+  }
+  .modal-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 6px;
+  }
+  .modal-sub {
+    font-size: 12px;
+    color: #94a3b8;
+    margin-bottom: 18px;
+    line-height: 1.5;
+  }
+  .modal-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .modal-input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1.5px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: 'SF Mono', 'Consolas', monospace;
+    color: #334155;
+    box-sizing: border-box;
+    transition: border-color 0.15s;
+  }
+  .modal-input:focus { outline: none; border-color: #1a6faf; }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 20px;
+  }
+  .modal-btn {
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s;
+  }
+  .modal-btn-cancel {
+    background: #f1f5f9;
+    color: #64748b;
+  }
+  .modal-btn-cancel:hover { background: #e2e8f0; }
+  .modal-btn-save {
+    background: #1a6faf;
+    color: #fff;
+  }
+  .modal-btn-save:hover { background: #15577f; }
+  .modal-btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
+  .modal-msg {
+    font-size: 12px;
+    margin-top: 12px;
+    padding: 8px 12px;
+    border-radius: 7px;
+    display: none;
+  }
+  .modal-msg.ok { display: block; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+  .modal-msg.err { display: block; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
 </style>
 </head>
 <body>
@@ -1082,7 +1230,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- ── Data Status ── -->
   <div class="card">
-    <div class="card-title">📂 Data Status</div>
+    <div class="card-title">📂 Data Status <button class="settings-btn" onclick="openSettings()" title="Data file settings">⚙️</button></div>
     <div id="staleBanner" class="stale-banner hidden">
       ⚠️ Data file hasn't been updated in over 2 days — routes may not reflect current inventory.
     </div>
@@ -1726,6 +1874,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const btn = document.getElementById('runBtn');
     btn.disabled = false;
     btn.innerHTML = '<span>▶</span> Generate Routes';
+  }
+</script>
+
+<!-- ── Settings Modal ── -->
+<div class="modal-overlay" id="settingsModal">
+  <div class="modal-box">
+    <div class="modal-title">Data File Settings</div>
+    <div class="modal-sub">
+      Set the path to your SK_Delivery_System.xlsx file on this computer.
+      This is saved locally and won't affect other machines.
+    </div>
+    <div class="modal-label">File Path</div>
+    <input class="modal-input" id="settingsPath" type="text"
+           placeholder="C:\\Users\\...\\SK_Delivery_System.xlsx" spellcheck="false">
+    <div class="modal-msg" id="settingsMsg"></div>
+    <div class="modal-actions">
+      <button class="modal-btn modal-btn-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="modal-btn modal-btn-save" id="settingsSave" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  function openSettings() {
+    var msg = document.getElementById('settingsMsg');
+    msg.className = 'modal-msg'; msg.textContent = '';
+    fetch('/settings').then(function(r){ return r.json(); }).then(function(cfg){
+      document.getElementById('settingsPath').value = cfg.input_file || '';
+    }).catch(function(){});
+    document.getElementById('settingsModal').classList.add('open');
+  }
+
+  function closeSettings() {
+    document.getElementById('settingsModal').classList.remove('open');
+  }
+
+  document.getElementById('settingsModal').addEventListener('click', function(e) {
+    if (e.target === this) closeSettings();
+  });
+
+  function saveSettings() {
+    var btn = document.getElementById('settingsSave');
+    var msg = document.getElementById('settingsMsg');
+    var path = document.getElementById('settingsPath').value.trim();
+    if (!path) { msg.className = 'modal-msg err'; msg.textContent = 'Please enter a file path.'; return; }
+    btn.disabled = true;
+    msg.className = 'modal-msg'; msg.textContent = '';
+    fetch('/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({input_file: path})
+    }).then(function(r){ return r.json().then(function(d){ return {ok: r.ok, data: d}; }); })
+    .then(function(res){
+      btn.disabled = false;
+      if (res.ok) {
+        msg.className = 'modal-msg ok';
+        msg.textContent = 'Saved! Restart the app for the new path to take effect.';
+      } else {
+        msg.className = 'modal-msg err';
+        msg.textContent = res.data.error || 'Something went wrong.';
+      }
+    }).catch(function(){
+      btn.disabled = false;
+      msg.className = 'modal-msg err';
+      msg.textContent = 'Network error — is the app running?';
+    });
   }
 </script>
 

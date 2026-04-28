@@ -24,3 +24,6 @@ Thumbs.db
 
 # Secrets / local overrides (if added later)
 .env
+
+# Per-machine settings (set once, never overwritten by updates)
+local_config.json
