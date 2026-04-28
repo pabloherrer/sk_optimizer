@@ -6,6 +6,17 @@ nothing else in the codebase needs to be edited for routine tuning.
 """
 
 from pathlib import Path
+import sys, os
+
+# ── Force UTF-8 on Windows (prevents CP1252 crash with Unicode chars) ────────
+if sys.platform == 'win32':
+    os.environ.setdefault('PYTHONUTF8', '1')
+    if hasattr(sys.stdout, 'reconfigure'):
+        try:
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent

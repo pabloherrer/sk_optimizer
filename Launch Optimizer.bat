@@ -16,6 +16,10 @@ if not exist sk_venv (
     exit /b 1
 )
 
+:: ── Force UTF-8 so Unicode characters don't crash ──
+set PYTHONUTF8=1
+chcp 65001 >nul 2>&1
+
 :: ── Start app ─────────────────────────────────────
 echo.
 echo ================================================
