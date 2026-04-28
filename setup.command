@@ -42,12 +42,23 @@ PY_VERSION=$($PYTHON_CMD --version 2>&1)
 echo "Found: $PY_VERSION"
 echo ""
 
-# ── Check Python version is 3.10+ ────────────────
+# ── Check Python version is 3.10–3.13 ────────────
 PY_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.minor)")
 PY_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.major)")
 if [ "$PY_MAJOR" -lt 3 ] || [ "$PY_MINOR" -lt 10 ]; then
     echo "ERROR: Python 3.10 or newer is required (found $PY_VERSION)."
-    echo "Please install Python 3.12 and try again."
+    echo "Please install Python 3.12:"
+    echo "  brew install python@3.12"
+    read -p "Press Enter to close..."
+    exit 1
+fi
+if [ "$PY_MINOR" -gt 13 ]; then
+    echo "ERROR: Python 3.$PY_MINOR is too new — our packages don't support it yet."
+    echo ""
+    echo "Please install Python 3.12:"
+    echo "  brew install python@3.12"
+    echo ""
+    echo "Then delete the sk_venv folder and run this again."
     read -p "Press Enter to close..."
     exit 1
 fi

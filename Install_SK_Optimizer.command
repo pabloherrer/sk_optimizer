@@ -58,10 +58,23 @@ if [ "$PY_MAJOR" -lt 3 ] || [ "$PY_MINOR" -lt 10 ]; then
     echo ""
     echo "  Found $PY_VERSION — but Python 3.10+ is needed."
     echo ""
-    echo "  To upgrade, open Terminal and paste:"
+    echo "  To install, open Terminal and paste:"
     echo "    brew install python@3.12"
     echo ""
     echo "  Then double-click this file again."
+    echo ""
+    read -p "Press Enter to close..."
+    exit 1
+fi
+
+if [ "$PY_MINOR" -gt 13 ]; then
+    echo ""
+    echo "  Found $PY_VERSION — too new. Our packages don't support 3.14+ yet."
+    echo ""
+    echo "  Please install Python 3.12:"
+    echo "    brew install python@3.12"
+    echo ""
+    echo "  Then delete the sk_venv folder and double-click this file again."
     echo ""
     read -p "Press Enter to close..."
     exit 1

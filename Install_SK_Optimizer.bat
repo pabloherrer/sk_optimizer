@@ -32,8 +32,8 @@ if %errorlevel% neq 0 (
     echo   Python is not installed.
     echo.
     echo   To install it:
-    echo     1. Go to https://www.python.org/downloads/
-    echo     2. Click the big yellow "Download Python 3.12" button
+    echo     1. Go to https://www.python.org/downloads/release/python-31211/
+    echo     2. Download "Windows installer (64-bit)"
     echo     3. Run the installer
     echo     4. IMPORTANT: Check the box "Add Python to PATH"
     echo     5. Click "Install Now"
@@ -46,6 +46,30 @@ if %errorlevel% neq 0 (
 
 for /f "tokens=*" %%v in ('python --version 2^>^&1') do (
     echo   Found: %%v
+)
+
+:: Check version is 3.10–3.13 (3.14+ packages don't have wheels yet)
+for /f %%m in ('python -c "import sys; print(sys.version_info.minor)"') do set PY_MINOR=%%m
+
+if %PY_MINOR% gtr 13 (
+    echo.
+    echo   ERROR: Python 3.%PY_MINOR% is too new — our packages don't support it yet.
+    echo.
+    echo   Please install Python 3.12 from:
+    echo     https://www.python.org/downloads/release/python-31211/
+    echo.
+    echo   IMPORTANT: Check "Add Python to PATH" during install.
+    echo   After installing, delete "sk_venv" if it exists, then run this again.
+    echo.
+    pause
+    exit /b 1
+)
+if %PY_MINOR% lss 10 (
+    echo.
+    echo   ERROR: Python 3.%PY_MINOR% is too old. Please install Python 3.12.
+    echo     https://www.python.org/downloads/release/python-31211/
+    pause
+    exit /b 1
 )
 echo.
 
