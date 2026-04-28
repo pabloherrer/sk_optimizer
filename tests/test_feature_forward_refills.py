@@ -127,8 +127,10 @@ def test_solver_uses_eow_refill_for_load_plan():
         return
     r_planned = row['Refill_lbs'].iloc[0]
     # Per-day refills: d0=4000, d1=4500, d2=5000, d3=5500, d4=6000
-    # Solver uses refills_by_day[NUM_DAYS-1] = day-4 values = 6000
-    assert 4000 <= r_planned <= 6000, f"refill outside projected range: {r_planned}"
+    # Pool enrichment may bump the Refill_lbs to an end-of-week projection
+    # with NUM_DAYS × consumption = 5 × 500 = 2500, so eow_refill ≤ 6500.
+    # Acceptable range: [day-0 = 4000, enrichment-bumped = 6500].
+    assert 4000 <= r_planned <= 6500, f"refill outside projected range: {r_planned}"
 
 def _solve_wrapper(s):
     return solve_week(

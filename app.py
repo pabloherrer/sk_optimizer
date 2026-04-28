@@ -16,6 +16,8 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 # ── Auto-install Flask if missing ─────────────────────────────────────────────
 try:
     from flask import Flask, Response, jsonify, request, send_file
@@ -34,9 +36,9 @@ INPUT_FILE   = Path(os.environ.get('SK_INPUT_FILE',
                str(BASE_DIR / 'data' / 'SK_Delivery_System.xlsx')))
 SUMMARY_FILE = OUTPUT_DIR / 'last_run_summary.json'
 
-# Urgency thresholds (must match config.py)
-CRITICAL_DAYS = 1.5
-URGENT_DAYS   = 4.0
+# Import thresholds from config — never hardcode these
+sys.path.insert(0, str(BASE_DIR))
+from config import CRITICAL_DAYS, URGENT_DAYS, TRUCK_NAMES, NUM_TRUCKS, SATURDAY_TRUCKS
 
 app = Flask(__name__)
 
@@ -67,6 +69,24 @@ def _get_version() -> dict:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_int(v, default=0):
+    try:
+        if v is None or (isinstance(v, float) and (v != v)):  # NaN check
+            return default
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None or (isinstance(v, float) and (v != v)):
+            return default
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
 
 def _fmt_dt(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime('%b %d, %Y  %I:%M %p')
@@ -292,7 +312,9 @@ def index():
             .replace('__DATA_INFO__', json.dumps(info))
             .replace('__OUTPUTS__',   json.dumps(outputs))
             .replace('__VERSION__',   json.dumps(version))
-            .replace('__SUMMARY__',   json.dumps(summary)))
+            .replace('__SUMMARY__',   json.dumps(summary))
+            .replace('__TRUCK_NAMES__', json.dumps(TRUCK_NAMES))
+            .replace('__SATURDAY_TRUCKS__', json.dumps(SATURDAY_TRUCKS)))
 
 
 @app.route('/data-info')
@@ -316,12 +338,21 @@ def run_optimizer():
 
     data      = request.json or {}
     solve_sec = int(data.get('solve_sec', 300))
+    skip_ids  = data.get('skip_ids', [])
+    must_ids  = data.get('must_visit_ids', [])
+    active_trucks = data.get('active_trucks', TRUCK_NAMES)
     start_time = time.time()
 
     def generate():
         global _is_running
         try:
             env = {**os.environ, 'PYTHONUNBUFFERED': '1'}
+            if skip_ids:
+                env['SK_SKIP_IDS'] = ','.join(str(x) for x in skip_ids)
+            if must_ids:
+                env['SK_MUST_VISIT_IDS'] = ','.join(str(x) for x in must_ids)
+            if len(active_trucks) < NUM_TRUCKS:
+                env['SK_ACTIVE_TRUCKS'] = ','.join(active_trucks)
             cmd = [
                 sys.executable, '-u',
                 str(BASE_DIR / 'run_unified.py'),
@@ -391,6 +422,49 @@ def view_map(filename):
 def status():
     outputs = get_latest_outputs()
     return jsonify({'running': _is_running, **outputs})
+
+
+@app.route('/snapshot')
+def snapshot_route():
+    """Return pre-solve client estimates: who needs oil, urgency, DTE, refill lbs."""
+    try:
+        from load_data import load_all
+        from forecast_consumption import estimate_consumption_rates
+        from inventory import enrich_snapshot
+        from state import load_state, initialise_state_from_snapshot
+        from config import STATE_FILE as SF, EXCLUDED_CLIENT_IDS
+
+        clients_raw, deliveries = load_all(INPUT_FILE)
+        today = pd.Timestamp.today().normalize()
+        clients_df = estimate_consumption_rates(deliveries, clients_raw, today=today)
+        state = load_state(SF)
+        if not state:
+            state = initialise_state_from_snapshot(clients_df)
+        snapshot = enrich_snapshot(clients_df, state)
+
+        excluded = set(str(x) for x in EXCLUDED_CLIENT_IDS)
+        rows = []
+        for _, r in snapshot.iterrows():
+            cid = str(r.get('ID', ''))
+            if cid in excluded:
+                continue
+            dte = _safe_float(r.get('Days_Until_Stockout'), 999)
+            dte = round(dte, 1)
+            rows.append({
+                'id':       cid,
+                'name':     str(r.get('Customer', '')),
+                'dte':      dte,
+                'urgency':  str(r.get('Urgency', 'normal')),
+                'refill':   _safe_int(r.get('Refill_Today_lbs')),
+                'tank':     _safe_int(r.get('Tank_lbs')),
+                'current':  _safe_int(r.get('Current_lbs')),
+                'rate':     round(_safe_float(r.get('Avg_LbsPerDay')), 1),
+                'fill_pct': round(_safe_float(r.get('Fill_Pct_Today')) * 100),
+            })
+        rows.sort(key=lambda x: x['dte'])
+        return jsonify({'clients': rows, 'today': str(today.date())})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # ── HTML Template ─────────────────────────────────────────────────────────────
@@ -789,6 +863,202 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .divider { color: #cbd5e1; font-size: 13px; }
 
   .hidden { display: none !important; }
+
+  /* ── Fleet Control ── */
+  .fleet-grid { display: flex; gap: 10px; }
+  .truck-tile {
+    flex: 1;
+    padding: 14px;
+    border: 2px solid #22c55e;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+  }
+  .truck-tile.off {
+    border-color: #e2e8f0;
+    background: #f8fafc;
+    opacity: 0.6;
+  }
+  .truck-tile.backup {
+    border: 2px dashed #94a3b8;
+    opacity: 0.5;
+  }
+  .truck-tile.backup.on {
+    border: 2px solid #f59e0b;
+    opacity: 1;
+    background: #fffbeb;
+  }
+  .truck-tile-name { font-size: 14px; font-weight: 700; }
+  .truck-tile-info { font-size: 12px; color: #64748b; margin-top: 3px; }
+  .truck-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block; margin-right: 6px; vertical-align: middle;
+  }
+  .truck-dot.on  { background: #22c55e; }
+  .truck-dot.off { background: #cbd5e1; }
+
+  /* ── Client Review ── */
+  .client-review-header {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 14px;
+  }
+  .urgency-counts {
+    display: flex; gap: 6px; flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .urg-chip {
+    padding: 4px 11px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .urg-chip.stockout  { background: #fee2e2; color: #991b1b; }
+  .urg-chip.critical  { background: #ffedd5; color: #9a3412; }
+  .urg-chip.urgent    { background: #fef3c7; color: #92400e; }
+  .urg-chip.normal    { background: #d1fae5; color: #065f46; }
+
+  .client-list {
+    max-height: 420px;
+    overflow-y: auto;
+    border: 1px solid #e8edf2;
+    border-radius: 10px;
+    margin-bottom: 14px;
+  }
+  .client-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    border-bottom: 1px solid #f1f5f9;
+    font-size: 13px;
+    transition: background 0.1s;
+  }
+  .client-row:last-child { border-bottom: none; }
+  .client-row:hover { background: #f8fafc; }
+  .client-row.stockout  { background: #fef2f2; }
+  .client-row.critical  { background: #fff7ed; }
+  .client-row.skipped {
+    background: #f8fafc;
+    opacity: 0.7;
+  }
+  .client-row.skipped .client-name {
+    text-decoration: line-through;
+    color: #94a3b8;
+  }
+  .client-row.must-visit {
+    background: #eff6ff;
+    border-left: 3px solid #1a6faf;
+  }
+  .urg-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .urg-dot.stockout { background: #dc2626; }
+  .urg-dot.critical { background: #ea580c; }
+  .urg-dot.urgent   { background: #d97706; }
+  .urg-dot.normal   { background: #22c55e; }
+
+  .client-name { flex: 1; font-weight: 500; }
+  .client-meta { font-size: 11.5px; color: #64748b; min-width: 100px; text-align: right; }
+  .btn-skip, .btn-must, .btn-undo {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 14px;
+    cursor: pointer;
+    border: 1px solid;
+    font-weight: 600;
+    transition: all 0.1s;
+    white-space: nowrap;
+  }
+  .btn-skip {
+    background: #f1f5f9;
+    border-color: #e2e8f0;
+    color: #64748b;
+  }
+  .btn-skip:hover { background: #e2e8f0; }
+  .btn-must {
+    background: #eff6ff;
+    border-color: #bfdbfe;
+    color: #1d4ed8;
+  }
+  .btn-must:hover { background: #dbeafe; }
+  .btn-undo {
+    background: white;
+    border-color: #e2e8f0;
+    color: #64748b;
+  }
+  .btn-undo:hover { background: #f8fafc; }
+
+  .review-note {
+    font-size: 12px;
+    color: #64748b;
+    padding: 10px 14px;
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
+    border-radius: 8px;
+    line-height: 1.5;
+    margin-bottom: 14px;
+  }
+  .review-note b { color: #0369a1; }
+
+  .add-client-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .add-client-bar input {
+    flex: 1;
+    padding: 9px 14px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+  }
+  .add-client-bar input:focus { border-color: #93c5fd; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
+  .add-client-bar button {
+    padding: 9px 16px;
+    background: #1a6faf;
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .add-client-bar button:hover { background: #155f9a; }
+
+  .override-summary {
+    font-size: 12.5px;
+    padding: 10px 14px;
+    background: #fef3c7;
+    border: 1px solid #fbbf24;
+    border-radius: 8px;
+    color: #92400e;
+    font-weight: 600;
+    margin-bottom: 14px;
+  }
+  .section-divider {
+    font-size: 11px;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 6px 12px;
+    background: #f8fafc;
+    border-bottom: 1px solid #f1f5f9;
+    font-weight: 600;
+  }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 18px; height: 18px;
+    border: 2px solid #e2e8f0;
+    border-top-color: #1a6faf;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -843,7 +1113,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="plan-window-icon">📅</div>
       <div>
         <div class="plan-window-text" id="planWindowText">Loading…</div>
-        <div class="plan-window-sub">Full 5-day delivery schedule · 4 trucks</div>
+        <div class="plan-window-sub">10-day horizon · 2-day commit · 2 trucks</div>
       </div>
     </div>
 
@@ -867,7 +1137,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
     </details>
+  </div>
 
+  <!-- ── Fleet Control ── -->
+  <div class="card">
+    <div class="card-title">🚛 Fleet</div>
+    <div class="fleet-grid" id="fleetGrid"></div>
+  </div>
+
+  <!-- ── Client Review ── -->
+  <div class="card" id="reviewCard">
+    <div class="card-title">
+      <span>📋 Pre-Solve Review</span>
+      <div class="loading-spinner" id="reviewSpinner" style="margin-left:auto;"></div>
+    </div>
+
+    <div class="review-note" id="reviewNote">
+      Loading inventory estimates… This shows which clients the optimizer will consider scheduling.
+      You can <b>skip</b> clients you know don't need oil, or mark clients as <b>must-visit</b> to guarantee delivery.
+    </div>
+
+    <div class="urgency-counts" id="urgCounts"></div>
+
+    <div id="overrideSummary" class="override-summary hidden"></div>
+
+    <!-- Search bar — always visible -->
+    <div class="add-client-bar">
+      <input type="text" id="searchInput" placeholder="Search clients by name or ID…" autocomplete="off">
+    </div>
+
+    <div class="client-list" id="clientList">
+      <div style="padding:40px;text-align:center;color:#94a3b8;">
+        <div class="loading-spinner" style="margin:0 auto 12px;"></div>
+        Loading client data…
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span style="font-size:11.5px;color:#94a3b8;" id="clientCountLabel"></span>
+    </div>
+  </div>
+
+  <!-- ── Generate Routes ── -->
+  <div class="card">
     <button class="btn-run" id="runBtn" onclick="runOptimizer()">
       <span>▶</span> Generate Routes
     </button>
@@ -890,6 +1202,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <!-- ── Results ── -->
   <div class="card hidden" id="resultsCard">
     <div class="card-title">✅ Routes Ready</div>
+    <div style="font-size:13px;color:#64748b;margin-bottom:12px;">
+      <b>Committed</b> routes (first 2 days) are ready for dispatch.
+      <b>Tentative</b> routes (days 3-10) are lookahead — they'll be refined tomorrow.
+    </div>
     <div class="dl-row">
       <a class="dl-btn dl-excel" id="excelLink" href="#" download>
         📊 Download Schedule
@@ -926,6 +1242,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   let selectedSec = 300;
 
+  // ── State ───────────────────────────────────────────────────────────────────
+  const TRUCK_NAMES = __TRUCK_NAMES__;
+  let activeTrucks = new Set(TRUCK_NAMES);
+  let allClients   = [];     // full snapshot from /snapshot
+  let skipIds      = new Set();
+  let mustVisitIds = new Set();
+  let showAllClients = false; // toggle for showing non-urgent clients
+
   // ── Version badge ───────────────────────────────────────────────────────────
   if (VERSION && VERSION.hash !== '—') {
     document.getElementById('versionText').textContent = VERSION.hash + ' · ' + VERSION.date;
@@ -939,14 +1263,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     '<br>' + now.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit'});
 
   // ── Compute planning window ────────────────────────────────────────────────
-  // Work-week: Tue–Sat (JS day numbers 2–6)
   const WORK_JS_DAYS = new Set([2, 3, 4, 5, 6]);
   const DAY_NAMES    = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   const today = new Date(now); today.setHours(0,0,0,0);
 
   const planDates = [];
   const cursor = new Date(today);
-  cursor.setDate(cursor.getDate() + 1); // start from tomorrow
+  cursor.setDate(cursor.getDate() + 1);
   for (let safety = 0; safety < 30 && planDates.length < 5; safety++) {
     if (WORK_JS_DAYS.has(cursor.getDay())) planDates.push(new Date(cursor));
     cursor.setDate(cursor.getDate() + 1);
@@ -960,13 +1283,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   // ── Populate data info ─────────────────────────────────────────────────────
   function populateDataInfo(d) {
-    // Stale warning
     if (d.stale) {
       document.getElementById('staleBanner').classList.remove('hidden');
       document.getElementById('fileCell').classList.add('stale');
     }
-
-    // Client count / file status
     if (d.client_count && d.client_count !== '—') {
       document.getElementById('infoClients').innerHTML =
         d.client_count + ' clients <span class="badge badge-green">loaded</span>';
@@ -977,11 +1297,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('infoClients').innerHTML =
         '<span class="badge badge-yellow">Not found</span>';
     }
-    // Show filename (not full path)
     document.getElementById('infoFilename').textContent =
       d.input_filename || d.input_path || '—';
-
-    // Last delivery
     if (d.last_delivery) {
       document.getElementById('infoLastDelivery').textContent = d.last_delivery;
       document.getElementById('infoDeliveryCount').textContent =
@@ -990,8 +1307,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('infoLastDelivery').textContent = 'No data';
       document.getElementById('infoDeliveryCount').textContent = '—';
     }
-
-    // File modified date
     if (d.input_modified) {
       document.getElementById('infoModified').textContent = d.input_modified;
       document.getElementById('infoStatus').textContent =
@@ -1002,12 +1317,233 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
   }
   populateDataInfo(DATA_INFO);
+  fetch('/data-info').then(r => r.json()).then(d => populateDataInfo(d)).catch(() => {});
 
-  // Fetch richer data async
-  fetch('/data-info')
-    .then(r => r.json())
-    .then(d => populateDataInfo(d))
-    .catch(() => {});
+  // ── Saturday auto-detection ─────────────────────────────────────────────────
+  // On Saturdays, one truck runs Tucson/Flagstaff. Auto-restrict metro planning
+  // to SATURDAY_TRUCKS (from config). Users can still override manually.
+  const SATURDAY_TRUCKS = __SATURDAY_TRUCKS__;
+  const isSaturdayPlan = planDates.length > 0 && planDates.some(d => d.getDay() === 6);
+  let saturdayMode = false;
+
+  if (isSaturdayPlan && SATURDAY_TRUCKS.length < TRUCK_NAMES.length) {
+    saturdayMode = true;
+    // Don't auto-remove trucks from activeTrucks — the solver handles per-day
+    // restriction internally. But show a notice.
+  }
+
+  // ── Fleet Control ──────────────────────────────────────────────────────────
+  function renderFleet() {
+    const grid = document.getElementById('fleetGrid');
+    let html = TRUCK_NAMES.map(name => {
+      const isOn = activeTrucks.has(name);
+      const isSatOnly = saturdayMode && !SATURDAY_TRUCKS.includes(name);
+      const info = isSatOnly ? 'Tucson/Flagstaff on Sat' : (isOn ? 'Active' : 'Out of service');
+      return `
+        <div class="truck-tile ${isOn ? '' : 'off'}" onclick="toggleTruck('${name}')">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <div class="truck-dot ${isOn ? 'on' : 'off'}"></div>
+            <span class="truck-tile-name">${name}</span>
+          </div>
+          <div class="truck-tile-info">${info}</div>
+          ${isSatOnly && isOn ? '<div style="font-size:11px;color:var(--amber);margin-top:2px;">Sat: 1 truck metro only</div>' : ''}
+        </div>`;
+    }).join('');
+    grid.innerHTML = html;
+  }
+
+  function toggleTruck(name) {
+    if (activeTrucks.has(name)) {
+      if (activeTrucks.size <= 1) return; // need at least 1
+      activeTrucks.delete(name);
+    } else {
+      activeTrucks.add(name);
+    }
+    renderFleet();
+    updateOverrideSummary();
+  }
+
+  renderFleet();
+
+  // ── Client Review ──────────────────────────────────────────────────────────
+  function loadSnapshot() {
+    fetch('/snapshot')
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) throw new Error(data.error);
+        allClients = data.clients || [];
+        document.getElementById('reviewSpinner').style.display = 'none';
+        document.getElementById('reviewNote').innerHTML =
+          'Stockout and critical clients are <b>automatically prioritized</b> by the solver. ' +
+          'Use <b>Skip</b> if you know a client doesn\\'t need oil yet, or <b>Must</b> to force a normal client onto the schedule.';
+        renderClientList();
+      })
+      .catch(err => {
+        document.getElementById('reviewSpinner').style.display = 'none';
+        document.getElementById('clientList').innerHTML =
+          '<div style="padding:30px;text-align:center;color:#ef4444;">Failed to load: ' + err.message + '</div>';
+      });
+  }
+
+  function renderClientList() {
+    // Determine which clients to show:
+    // If searching, show all matches regardless of threshold.
+    // Otherwise show urgent/critical/stockout + overrides (DTE ≤ 12),
+    // or everything if showAllClients is toggled on.
+    const SHOW_THRESHOLD = 12;
+    let visible = allClients.filter(c => {
+      // Search filter first
+      if (_searchQuery) {
+        return c.name.toLowerCase().includes(_searchQuery) ||
+               c.id.toLowerCase().includes(_searchQuery);
+      }
+      if (mustVisitIds.has(c.id) || skipIds.has(c.id)) return true;
+      if (showAllClients) return true;
+      return c.dte <= SHOW_THRESHOLD;
+    });
+
+    // Urgency counts (from ALL clients, not just visible)
+    const counts = {stockout: 0, critical: 0, urgent: 0, normal: 0};
+    allClients.forEach(c => { counts[c.urgency] = (counts[c.urgency] || 0) + 1; });
+
+    document.getElementById('urgCounts').innerHTML = [
+      counts.stockout ? `<div class="urg-chip stockout">${counts.stockout} stockout</div>` : '',
+      counts.critical ? `<div class="urg-chip critical">${counts.critical} critical</div>` : '',
+      counts.urgent   ? `<div class="urg-chip urgent">${counts.urgent} urgent</div>` : '',
+      `<div class="urg-chip normal">${counts.normal} on track</div>`,
+    ].join('');
+
+    // Group: must-visit first, then by urgency, then skipped at bottom
+    const mustFirst = visible.filter(c => mustVisitIds.has(c.id));
+    const skipped   = visible.filter(c => skipIds.has(c.id) && !mustVisitIds.has(c.id));
+    const regular   = visible.filter(c => !mustVisitIds.has(c.id) && !skipIds.has(c.id));
+
+    const ordered = [...mustFirst, ...regular, ...skipped];
+
+    let html = '';
+
+    if (mustFirst.length) {
+      html += '<div class="section-divider">Must Visit</div>';
+      html += mustFirst.map(c => clientRowHtml(c)).join('');
+    }
+
+    if (regular.length) {
+      html += '<div class="section-divider">Estimated Needs (' + regular.length + ')</div>';
+      html += regular.map(c => clientRowHtml(c)).join('');
+    }
+
+    if (skipped.length) {
+      html += '<div class="section-divider">Skipped</div>';
+      html += skipped.map(c => clientRowHtml(c)).join('');
+    }
+
+    document.getElementById('clientList').innerHTML = html || '<div style="padding:30px;text-align:center;color:#94a3b8;">No clients to show</div>';
+
+    const hiddenCount = allClients.length - visible.length;
+    const label = document.getElementById('clientCountLabel');
+    if (hiddenCount > 0 && !showAllClients) {
+      label.innerHTML = `Showing ${visible.length} of ${allClients.length} clients · <a href="#" onclick="showAll(event)" style="color:#1a6faf;font-weight:600;">Show all</a>`;
+    } else if (showAllClients) {
+      label.innerHTML = `Showing all ${allClients.length} clients · <a href="#" onclick="showLess(event)" style="color:#1a6faf;font-weight:600;">Show less</a>`;
+    } else {
+      label.textContent = `${visible.length} clients`;
+    }
+
+    updateOverrideSummary();
+  }
+
+  function clientRowHtml(c) {
+    const isSkipped = skipIds.has(c.id);
+    const isMust    = mustVisitIds.has(c.id);
+    let cls = 'client-row ' + c.urgency;
+    if (isSkipped) cls = 'client-row skipped';
+    if (isMust)    cls = 'client-row must-visit';
+
+    const dteStr = c.dte >= 999 ? 'n/a' : c.dte.toFixed(1) + 'd';
+    const tankPct = c.tank > 0 ? Math.round((c.current / c.tank) * 100) : 0;
+
+    // Mini tank gauge
+    const gaugeColor = c.urgency === 'stockout' ? '#dc2626'
+                     : c.urgency === 'critical' ? '#ea580c'
+                     : c.urgency === 'urgent'   ? '#d97706'
+                     : '#22c55e';
+
+    let buttons = '';
+    if (isSkipped) {
+      buttons = `<button class="btn-undo" onclick="undoClient('${c.id}')" style="background:#fee2e2;border-color:#fca5a5;color:#dc2626;">✕ Restore</button>`;
+    } else if (isMust) {
+      buttons = `<button class="btn-undo" onclick="undoClient('${c.id}')">Remove</button>`;
+    } else if (c.urgency === 'stockout' || c.urgency === 'critical') {
+      // Solver already forces these — only offer Skip override
+      buttons = `<button class="btn-skip" onclick="skipClient('${c.id}')">Skip</button>`;
+    } else {
+      buttons = `<button class="btn-skip" onclick="skipClient('${c.id}')">Skip</button>` +
+                `<button class="btn-must" onclick="mustClient('${c.id}')">Must</button>`;
+    }
+
+    return `<div class="${cls}" data-id="${c.id}">
+      <div class="urg-dot ${c.urgency}"></div>
+      <div class="client-name" title="${c.id}">${c.name}</div>
+      <div class="client-meta">
+        <span title="Days to empty">${dteStr}</span>
+        <span style="margin:0 4px;color:#cbd5e1;">·</span>
+        <span title="Tank: ${tankPct}% full (${c.current}/${c.tank} lbs)">
+          <span style="display:inline-block;width:32px;height:6px;background:#e2e8f0;border-radius:3px;vertical-align:middle;position:relative;overflow:hidden;">
+            <span style="position:absolute;left:0;top:0;height:100%;width:${tankPct}%;background:${gaugeColor};border-radius:3px;"></span>
+          </span>
+          ${tankPct}%
+        </span>
+        <span style="margin:0 4px;color:#cbd5e1;">·</span>
+        <span title="Estimated refill">${c.refill} lbs</span>
+      </div>
+      <div style="display:flex;gap:4px;flex-shrink:0;">${buttons}</div>
+    </div>`;
+  }
+
+  function skipClient(id) {
+    mustVisitIds.delete(id);
+    skipIds.add(id);
+    renderClientList();
+  }
+
+  function mustClient(id) {
+    skipIds.delete(id);
+    mustVisitIds.add(id);
+    renderClientList();
+  }
+
+  function undoClient(id) {
+    skipIds.delete(id);
+    mustVisitIds.delete(id);
+    renderClientList();
+  }
+
+  function showAll(e) { e.preventDefault(); showAllClients = true; renderClientList(); }
+  function showLess(e) { e.preventDefault(); showAllClients = false; renderClientList(); }
+
+  function updateOverrideSummary() {
+    const el = document.getElementById('overrideSummary');
+    const parts = [];
+    if (skipIds.size) parts.push(skipIds.size + ' skipped');
+    if (mustVisitIds.size) parts.push(mustVisitIds.size + ' must-visit');
+    if (activeTrucks.size < TRUCK_NAMES.length) parts.push((TRUCK_NAMES.length - activeTrucks.size) + ' truck(s) offline');
+    if (parts.length) {
+      el.textContent = 'Overrides: ' + parts.join(' · ');
+      el.classList.remove('hidden');
+    } else {
+      el.classList.add('hidden');
+    }
+  }
+
+  // Inline search — always visible, filters the list in place
+  let _searchQuery = '';
+  document.getElementById('searchInput')?.addEventListener('input', function(e) {
+    _searchQuery = e.target.value.toLowerCase().trim();
+    renderClientList();
+  });
+
+  // Load snapshot on page load
+  loadSnapshot();
 
   // ── Last Run card ──────────────────────────────────────────────────────────
   function renderLastRun(s) {
@@ -1015,7 +1551,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const card = document.getElementById('lastRunCard');
     card.classList.remove('hidden');
 
-    // Meta line: timestamp + elapsed
     const ts = s.timestamp ? new Date(s.timestamp) : null;
     const tsStr = ts
       ? ts.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'}) +
@@ -1027,7 +1562,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('lastRunMeta').textContent =
       [tsStr, elapsed].filter(Boolean).join('  ·  ');
 
-    // Urgency pills
     const urg = s.urgency || {};
     let urgHtml = '';
     if (urg.critical) urgHtml += `<div class="urgency-pill critical"><div class="urgency-dot"></div>${urg.critical} critical</div>`;
@@ -1035,7 +1569,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     if (urg.normal)   urgHtml += `<div class="urgency-pill normal"><div class="urgency-dot"></div>${urg.normal} on track</div>`;
     document.getElementById('urgencyRow').innerHTML = urgHtml || '<span style="color:#94a3b8;font-size:13px;">No urgency data</span>';
 
-    // Stat chips
     const chips = [];
     if (s.routes_count)  chips.push({val: s.routes_count,  label: 'Routes'});
     if (s.total_stops)   chips.push({val: s.total_stops,   label: 'Stops'});
@@ -1045,7 +1578,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       `<div class="stat-chip"><div class="stat-chip-val">${c.val}</div><div class="stat-chip-label">${c.label}</div></div>`
     ).join('');
 
-    // File links
     let linksHtml = '';
     if (s.excel_file) linksHtml += `<a class="prev-link" href="/download/${s.excel_file}">📊 ${s.excel_file}</a>`;
     if (s.excel_file && s.map_file) linksHtml += `<span class="divider">·</span>`;
@@ -1071,7 +1603,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     const tmr  = document.getElementById('statusTimer');
     bar.style.width = '0%';
     bar.classList.remove('done');
-
     _timerInterval = setInterval(() => {
       const elapsed = (Date.now() - _startTime) / 1000;
       const pct     = Math.min((elapsed / totalSec) * 100, 98);
@@ -1112,10 +1643,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     setStatus('running', 'Running optimizer…');
     startTimer(selectedSec);
 
+    const payload = {
+      solve_sec: selectedSec,
+      skip_ids: Array.from(skipIds),
+      must_visit_ids: Array.from(mustVisitIds),
+      active_trucks: Array.from(activeTrucks),
+    };
+
     fetch('/run', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({solve_sec: selectedSec}),
+      body: JSON.stringify(payload),
     }).then(resp => {
       const reader  = resp.body.getReader();
       const decoder = new TextDecoder();
@@ -1171,11 +1709,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (data.excel) document.getElementById('excelLink').href = '/download/' + data.excel;
         if (data.map)   document.getElementById('mapLink').href   = '/view/' + data.map;
       }
-      // Refresh Last Run card from server
-      fetch('/last-run')
-        .then(r => r.json())
-        .then(s => renderLastRun(s))
-        .catch(() => {});
+      fetch('/last-run').then(r => r.json()).then(s => renderLastRun(s)).catch(() => {});
     } else {
       setStatus('fail', 'Failed — see log for details');
     }

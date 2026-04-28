@@ -70,13 +70,43 @@ def estimate_consumption_rates(
     clean_rates = _remove_outliers(dl[dl['Rate'].notna()].copy())
 
     # ── Step 3: Per-client summary ────────────────────────────────────────────
+    # Use MEDIAN rate for clients with ≥3 deliveries (robust against one-off
+    # spikes from early re-deliveries or emergency top-offs).  Fall back to
+    # 'last' only for 1-2 delivery clients where median isn't meaningful.
+    #
+    # History: original code used ('Rate', 'last') to match SK's own
+    # methodology. Backtest showed this inflates demand ~18% — 24 clients
+    # had rates >1.5x their actual consumption because a single short gap
+    # (early re-delivery) produced an artificially high rate. Median is
+    # resistant to these one-off spikes while still reflecting true demand.
+    clean_rates_sorted = clean_rates.sort_values(['Customer', 'Date'])
     client_stats = (
-        clean_rates.groupby('Customer')
+        clean_rates_sorted.groupby('Customer')
         .agg(
-            Avg_LbsPerDay   = ('Rate', 'mean'),
-            Delivery_Count  = ('Rate', 'count'),
+            Rate_Last        = ('Rate', 'last'),
+            Rate_Median      = ('Rate', 'median'),
+            Delivery_Count   = ('Rate', 'count'),
         )
         .reset_index()
+    )
+    # Primary rate: median if we have ≥3 data points, else last (only option)
+    client_stats['Avg_LbsPerDay'] = np.where(
+        client_stats['Delivery_Count'] >= 3,
+        client_stats['Rate_Median'],
+        client_stats['Rate_Last'],
+    )
+
+    # Consumption-trend flag: if the most-recent gap differs from the client's
+    # historical median by more than CONSUMPTION_SHIFT_PCT, mark as 'shift' so
+    # operators can review (could be real seasonal change OR a noisy one-off).
+    _CONSUMPTION_SHIFT_PCT = 0.50  # 50% deviation threshold
+    client_stats['Consumption_Shift'] = np.where(
+        (client_stats['Rate_Median'] > 0)
+        & (client_stats['Delivery_Count'] >= 3)
+        & (abs(client_stats['Rate_Last'] - client_stats['Rate_Median'])
+           / client_stats['Rate_Median'] > _CONSUMPTION_SHIFT_PCT),
+        'shift',
+        'stable',
     )
 
     last_delivery = (
@@ -88,35 +118,33 @@ def estimate_consumption_rates(
     # ── Step 4: Merge into clients_df ─────────────────────────────────────────
     result = clients_df.copy()
     result = result.merge(
-        client_stats[['Customer', 'Avg_LbsPerDay', 'Delivery_Count', 'Last_Date']],
+        client_stats[['Customer', 'Avg_LbsPerDay', 'Rate_Last', 'Rate_Median',
+                      'Delivery_Count', 'Consumption_Shift', 'Last_Date']],
         on='Customer', how='left',
     )
+    # Clients with no/insufficient history get 'stable' default for Shift flag
+    result['Consumption_Shift'] = result['Consumption_Shift'].fillna('stable')
     result = result.merge(last_delivery, on='Customer', how='left', suffixes=('', '_dup'))
     if 'Last_Date_dup' in result.columns:
         result['Last_Date'] = result['Last_Date'].fillna(result['Last_Date_dup'])
         result.drop(columns='Last_Date_dup', inplace=True)
 
-    # ── Step 5: Fill missing rates with zone → global medians ─────────────────
-    # Clients with fewer than MIN_DELIVERIES_FOR_OWN_RATE are treated as missing.
-    needs_fallback = result['Delivery_Count'].isna() | (
-        result['Delivery_Count'] < MIN_DELIVERIES_FOR_OWN_RATE
-    )
-    result.loc[needs_fallback, 'Avg_LbsPerDay'] = np.nan
-
-    global_median = _safe_median(result['Avg_LbsPerDay'])
-    result['Rate_Source'] = 'own'
-
-    for zone in result['Zone'].unique():
-        mask_zone    = result['Zone'] == zone
-        zone_median  = _safe_median(result.loc[mask_zone, 'Avg_LbsPerDay'], global_median)
-        needs_zone   = mask_zone & result['Avg_LbsPerDay'].isna()
-        result.loc[needs_zone, 'Avg_LbsPerDay'] = zone_median
-        result.loc[needs_zone, 'Rate_Source']   = 'zone_median'
-
-    still_missing = result['Avg_LbsPerDay'].isna()
-    result.loc[still_missing, 'Avg_LbsPerDay'] = global_median
-    result.loc[still_missing, 'Rate_Source']   = 'global_median'
+    # ── Step 5: Tag clients without enough data — DO NOT fabricate a rate ────
+    # Rationale (per SK): a single delivery with no prior visit gives no rate
+    # observation at all (we can't divide by an unknown gap), and a made-up
+    # zone/global median routinely over-estimates slow consumers (e.g., 51ST
+    # at 6.9 lbs/day got pushed to 50.7 by zone median). Better to surface the
+    # client for human review than to schedule on a fabricated rate.
     result['Delivery_Count'] = result['Delivery_Count'].fillna(0).astype(int)
+    result['Rate_Source'] = np.where(
+        result['Delivery_Count'] >= 3, 'own_median', 'own_latest'
+    )
+
+    insufficient = result['Avg_LbsPerDay'].isna() | (result['Delivery_Count'] < 1)
+    result.loc[insufficient, 'Avg_LbsPerDay'] = np.nan
+    result.loc[insufficient, 'Rate_Source']   = 'INSUFFICIENT_DATA'
+
+    global_median = _safe_median(result.loc[~insufficient, 'Avg_LbsPerDay'])
 
     # ── Step 6: Current inventory estimate ────────────────────────────────────
     result['Days_Since_Last'] = (today - result['Last_Date']).dt.days
@@ -124,20 +152,29 @@ def estimate_consumption_rates(
     # which means we conservatively assume they are somewhat depleted.
     result['Days_Since_Used'] = result['Days_Since_Last'].fillna(FALLBACK_DAYS_SINCE)
 
+    # For INSUFFICIENT_DATA clients we cannot estimate current level — use the
+    # conservative assumption that tank is ~half full (they were delivered
+    # recently enough to still be on our books) so downstream code still runs.
+    # These clients will be excluded from the optimizer via the Rate_Source flag.
+    rate_for_calc = result['Avg_LbsPerDay'].fillna(0)
     result['Est_Current_lbs'] = (
         result['Tank_lbs']
-        - result['Days_Since_Used'] * result['Avg_LbsPerDay']
+        - result['Days_Since_Used'] * rate_for_calc
     ).clip(lower=result['Tank_lbs'] * 0.03,
            upper=result['Tank_lbs'])         # Can't exceed tank capacity
+    # Override: insufficient-data clients default to 50% tank
+    mask_insuf = result['Rate_Source'] == 'INSUFFICIENT_DATA'
+    result.loc[mask_insuf, 'Est_Current_lbs'] = (result.loc[mask_insuf, 'Tank_lbs'] * 0.5).round()
     result['Est_Current_lbs'] = result['Est_Current_lbs'].round()
 
     # ── Summary ────────────────────────────────────────────────────────────────
     src_counts = result['Rate_Source'].value_counts()
     print(f"  Consumption rates:  "
-          f"own={src_counts.get('own', 0)}  "
-          f"zone_median={src_counts.get('zone_median', 0)}  "
-          f"global_median={src_counts.get('global_median', 0)}")
-    print(f"  Global median rate: {global_median:.1f} lbs/day")
+          f"own_median={src_counts.get('own_median', 0)}  "
+          f"own_latest={src_counts.get('own_latest', 0)}  "
+          f"INSUFFICIENT_DATA={src_counts.get('INSUFFICIENT_DATA', 0)}")
+    if global_median is not None and not np.isnan(global_median):
+        print(f"  Global median rate (reference only): {global_median:.1f} lbs/day")
 
     return result
 

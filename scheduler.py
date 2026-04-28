@@ -72,9 +72,15 @@ def assign_customers_to_days(
     # ── Per-slot state ────────────────────────────────────────────────────────
     active_slots = [(t, d) for d in range(start_day, NUM_DAYS) for t in TRUCK_NAMES]
     slot_cap     = {s: TRUCKS[s[0]]['capacity_lbs'] for s in active_slots}
+    slot_stops   = {s: 0 for s in active_slots}
     slot_lat     = {s: [] for s in active_slots}
     slot_lon     = {s: [] for s in active_slots}
     assigned     = set()
+
+    # Max stops per truck-day: shift_cap / avg_service_time.
+    # 600 min shift, ~25 min avg per stop (18 setup + 5 pump + 2 travel) = ~14.
+    # Use 14 as hard cap to ensure time feasibility in Phase 2.
+    MAX_STOPS_PER_TRUCK_DAY = 14
 
     # ── Refill / fill / days-left matrices ────────────────────────────────────
     refill_mat    = np.zeros((n, NUM_DAYS))
@@ -140,12 +146,10 @@ def assign_customers_to_days(
         })
 
     # ── Cluster scheduling: EDF + balance (no territory constraint) ──────────
-    MIN_CLUSTER_ACTIVE = 3
-
-    schedulable = [
-        c for c in clusters
-        if (len(c['members']) >= MIN_CLUSTER_ACTIVE or c['has_critical'])
-    ]
+    # Any cluster with at least 1 active member gets scheduled.
+    # Previously MIN_CLUSTER_ACTIVE=3 killed small clusters, deferring ~70%
+    # of clients and leaving Truck9 idle most days.
+    schedulable = [c for c in clusters if len(c['members']) >= 1]
     schedulable.sort(key=lambda c: (c['min_stockout'],))
 
     for cluster in schedulable:
@@ -167,6 +171,8 @@ def assign_customers_to_days(
             for truck in TRUCK_NAMES:
                 if slot_cap.get((truck, d), 0) < day_demand * 0.6:
                     continue
+                if slot_stops.get((truck, d), 0) >= MAX_STOPS_PER_TRUCK_DAY:
+                    continue
                 used    = TRUCKS[truck]['capacity_lbs'] - slot_cap[(truck, d)]
                 balance = 1.0 - used / TRUCKS[truck]['capacity_lbs']
                 if balance > best_score:
@@ -178,7 +184,7 @@ def assign_customers_to_days(
 
         _schedule_cluster(df_rt, cluster, best_truck, best_day,
                           refill_mat, fill_pct_mat, days_left_mat,
-                          slot_cap, slot_lat, slot_lon, assigned)
+                          slot_cap, slot_stops, slot_lat, slot_lon, assigned)
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
     df_rt.drop(columns=['_acct_w'], inplace=True)
@@ -203,12 +209,15 @@ def assign_customers_to_days(
 def _schedule_cluster(
     df_rt, cluster, truck, day,
     refill_mat, fill_pct_mat, days_left_mat,
-    slot_cap, slot_lat, slot_lon, assigned,
+    slot_cap, slot_stops, slot_lat, slot_lon, assigned,
 ):
+    MAX_STOPS = 14  # Hard cap for time feasibility
     placed = 0
     for i in cluster['members']:
         if i in assigned:
             continue
+        if slot_stops.get((truck, day), 0) >= MAX_STOPS:
+            break  # Truck-day is full on time
         row    = df_rt.iloc[i]
         refill = refill_mat[i, day]
         fill   = fill_pct_mat[i, day]
@@ -227,6 +236,7 @@ def _schedule_cluster(
         slot_lat[(truck, day)].append(row['Lat'])
         slot_lon[(truck, day)].append(row['Lon'])
         slot_cap[(truck, day)] -= refill
+        slot_stops[(truck, day)] = slot_stops.get((truck, day), 0) + 1
         assigned.add(i)
         placed += 1
 

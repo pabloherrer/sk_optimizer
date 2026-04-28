@@ -42,6 +42,11 @@ TRUCKS = {
 TRUCK_NAMES = list(TRUCKS.keys())   # ['Truck2', 'Truck9']
 NUM_TRUCKS  = len(TRUCK_NAMES)
 
+# ── Saturday fleet ───────────────────────────────────────────────────────────
+# One truck always runs Tucson/Flagstaff on Saturdays, leaving only one truck
+# for the metro route. The solver will auto-restrict Saturday to this list.
+SATURDAY_TRUCKS = ['Truck2']        # Only Truck2 available for metro Saturdays
+
 # ── Work week ─────────────────────────────────────────────────────────────────
 DAYS     = ['Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 NUM_DAYS = len(DAYS)
@@ -58,14 +63,29 @@ OT_MULTIPLIER        = 1.5    # 1.5x base labor rate for minutes over SHIFT_MIN
 LABOR_COST_PER_MIN   = 50     # Base labor cost units per minute (≈ $30/hr driver → 50 units/min)
 OT_PENALTY_PER_MIN   = int(LABOR_COST_PER_MIN * (OT_MULTIPLIER - 1.0))  # = 25: the *extra* cost per OT minute
 
+# ── Deadline-coupled routing (ADR-001) ───────────────────────────────────────
+# Lateness penalty: cost units added per day a client is served past their
+# stockout deadline. Must stay proportional to distance — too high and the
+# solver ignores route geometry chasing penalty avoidance.
+# ~9 miles equivalent at 15,000.  Range: 10,000–25,000 reasonable.
+# 0 = disabled (legacy behavior: day-anonymous objective).
+LATE_PENALTY_PER_DAY = 5_000   # ~3 miles/day late — stronger push toward preferred fill day
+
+# Hard deadline slack: how many days past deadline a client can still be
+# assigned via hard constraint. 1 = one day of slack (solver CAN serve a
+# client one day late, but lateness penalty makes it a last resort).
+# 0 = strict (serve by deadline day or don't serve at all — risky with
+# tight capacity). Only applies to clients with deadlines within the week.
+DEADLINE_SLACK_DAYS = 1
+
 # ── Inventory thresholds ──────────────────────────────────────────────────────
 MIN_OIL_PCT      = 0.00   # 0 % floor — stockout protection handled by scheduler urgency
 MIN_FILL_PCT     = 0.00   # No hard visit gate — stops below preferred fill are allowed
                           # if they fit the route. Goal is route density + tank efficiency.
 PREFERRED_FILL_PCT = 0.85 # Preferred floor: optimizer scores higher-fill deliveries better
-SOFT_MIN_FILL_PCT = 0.60  # Soft gate: clients below 60 % fill get discounted score only
+SOFT_MIN_FILL_PCT = 0.65  # Soft gate: eligible at 65% empty; solver prefers higher via EW=2.5
 CRITICAL_DAYS = 1.5    # Stockout within 1.5 days → mandatory visit today
-URGENT_DAYS   = 4.0    # Stockout within 4 days   → high-priority
+URGENT_DAYS   = 3.0    # Stockout within 3 days   → high-priority (was 4 — too eager)
 
 # ── Contractual service cadence (from Aksen et al. 2012 SIRP formulation) ────
 # Customer contract caps the gap between two successive visits. Any client
@@ -75,7 +95,7 @@ URGENT_DAYS   = 4.0    # Stockout within 4 days   → high-priority
 # the previous model had no hard upper bound on visit spacing — only urgency
 # penalties keyed to stockout — so a client on vacation could quietly slip
 # past the 14-day contractual limit.
-MAX_SERVICE_INTERVAL_DAYS = 14
+MAX_SERVICE_INTERVAL_DAYS = 9999  # Disabled — S&K has no contractual max interval
 
 # ── Profit-weighted objective (Cornillier, Boctor, Laporte & Renaud 2009) ────
 # PSRPTW frames routing as profit = revenue(lbs delivered) − cost(miles + time).
@@ -86,7 +106,7 @@ MAX_SERVICE_INTERVAL_DAYS = 14
 # low-fill scatter — which matches S&K's business goal (route density +
 # tank efficiency) without abandoning distance minimization.
 # 0.0 = pure distance-min (legacy).  1.5 = strongly efficiency-weighted.
-EFFICIENCY_WEIGHT = 1.5
+EFFICIENCY_WEIGHT = 2.5  # Strongly prefer high-fill stops — more lbs per trip
 
 # ── Time windows enforcement (Cornillier PSRPTW) ──────────────────────────────
 # The codebase already loads time_windows_df but never applies it to the
@@ -113,7 +133,7 @@ USE_FORWARD_REFILLS = True
 # in one week if you can fill everything on the first visit.
 OPPORTUNISTIC_KM       = 8.0   # Max detour to pull in a neighbor (km).
                                 # 8 km ≈ 10-min drive in Phoenix — trivial.
-OPPORTUNISTIC_FILL_PCT = 0.50  # Minimum fill to justify the stop.
+OPPORTUNISTIC_FILL_PCT = 0.55  # Opportunistic backfill: if truck is already nearby, 55%+ is worth it.
                                 # 50 % = tank at least half empty → meaningful delivery.
                                 # Below 50 % the pump time may not justify the stop.
 
@@ -151,10 +171,35 @@ MIN_ROUTE_STOPS = 5    # Slots with fewer stops (and no urgent clients) are
 # Phase-2 OR-Tools objective: minimise total route time (time callbacks)
 # Distance is implicitly penalised through travel time.
 
+# ── Rolling Horizon (Campbell & Savelsbergh 2004, Jaillet et al. 2002) ────────
+# Plan each afternoon for the next HORIZON_DAYS working days. Only the first
+# COMMIT_DAYS are dispatched to drivers; the rest are tentative lookahead.
+# Re-run each afternoon with updated inventory (actuals replace projections).
+HORIZON_DAYS    = 10   # Total planning window (working days). 10 = two full Tue-Sat weeks.
+                       # Extended from 5 to fix the cascading-crunch problem: with a 5-day
+                       # window, clients at DTE 7-10 are deferred and become next week's
+                       # emergencies. A 10-day horizon lets the solver see two full weeks
+                       # and spread load across the weekend gap.
+COMMIT_DAYS     = 2    # Firm routes dispatched to drivers. 2 = today + tomorrow.
+                       # Remaining 8 days are tentative lookahead for capacity planning.
+HORIZON_BUFFER  = 3    # Days past horizon end to check for looming stockouts.
+                       # Clients whose stockout falls within HORIZON_BUFFER after
+                       # the plan ends get escalated disjunction penalties.
+
 # ── Solver ────────────────────────────────────────────────────────────────────
 SOLVE_SEC      = 90    # Time limit per day-solve (seconds) — legacy per-day
-SOLVE_SEC_WEEK = 300   # Unified solver: 5 min default (up to 1800 for production)
+SOLVE_SEC_WEEK = 600   # Unified solver: 10 min default for 10-day/60-vehicle horizon
+                       # (was 300 for 5-day/30-vehicle; doubled for 2x vehicles)
 SOLUTION_LIMIT = 1_000 # Early-stop if solver finds this many improving solutions
+
+# OR-Tools strategy overrides (string names, read via getattr on routing_enums_pb2).
+# Valid FirstSolutionStrategy names include: PATH_CHEAPEST_ARC, PATH_MOST_CONSTRAINED_ARC,
+# SAVINGS, CHRISTOFIDES, PARALLEL_CHEAPEST_INSERTION, LOCAL_CHEAPEST_INSERTION,
+# GLOBAL_CHEAPEST_ARC, AUTOMATIC, FIRST_UNBOUND_MIN_VALUE.
+# Valid LocalSearchMetaheuristic names include: GUIDED_LOCAL_SEARCH, SIMULATED_ANNEALING,
+# TABU_SEARCH, GENERIC_TABU_SEARCH, AUTOMATIC, GREEDY_DESCENT.
+FIRST_SOLUTION_STRATEGY   = 'PARALLEL_CHEAPEST_INSERTION'
+LOCAL_SEARCH_METAHEURISTIC = 'GUIDED_LOCAL_SEARCH'
 
 # ── Cost ─────────────────────────────────────────────────────────────────────
 COST_PER_MILE = 0.14   # USD per mile (fuel + wear)

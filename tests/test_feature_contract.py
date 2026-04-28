@@ -1,8 +1,15 @@
 """
-test_feature_contract.py — 14-day contract (Aksen, Kaya, Salman & Akça 2012 SIRP)
+test_feature_contract.py — Contractual cadence tests (DISABLED FEATURE)
 
-The solver must elevate a client whose Days_Since_Last + NUM_DAYS exceeds
-MAX_SERVICE_INTERVAL_DAYS to a mandatory visit this week.
+S&K has NO contractual max service interval. The prior 14-day contract
+enforcement (Aksen 2012 SIRP) was removed after business confirmed there
+is no such rule. MAX_SERVICE_INTERVAL_DAYS is set to 9999 (disabled).
+
+These tests verify that:
+  1. The solver does NOT force-schedule low-urgency clients purely based
+     on days-since-last-delivery (no false escalation).
+  2. Clients are still served when they actually need it (urgency/fill).
+  3. Accounting is correct (scheduled + deferred = total).
 """
 
 import sys
@@ -14,21 +21,16 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config import (
-    TRUCKS, DAYS, NUM_DAYS, PRODUCTS, MAX_SERVICE_INTERVAL_DAYS,
-)
+from config import TRUCKS, DAYS, NUM_DAYS, PRODUCTS
 from unified_solver import solve_week
 
 
 # ── Fixture helpers ─────────────────────────────────────────────────────────
 
 def _base_scenario(n=10, days_since_list=None):
-    """Small scenario where one client is contract-overdue.
-
-    days_since_list: list of Days_Since_Last values per client.
-    """
+    """Small scenario with clients at various days-since-last."""
     if days_since_list is None:
-        days_since_list = [3] * n  # everyone recently served
+        days_since_list = [3] * n
 
     clients = []
     for i in range(n):
@@ -115,73 +117,81 @@ def run_test(name, fn):
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 
-def test_contract_overdue_forced_in_plan():
-    """Days_Since_Last=13 with low tank urgency → still scheduled."""
+def test_no_false_contract_escalation():
+    """Days_Since_Last=13, low urgency, full tank → no forced scheduling.
+    With contractual cadence disabled, the solver should rely only on
+    urgency and fill economics. A nearly-full, low-urgency client should
+    NOT be forced in just because it's been 13 days."""
     n = 8
     days = [3] * n
-    days[0] = 13   # C000 is contract-overdue by end of week (13+5 >= 14)
+    days[0] = 13   # Would have triggered old 14-day contract rule
     s = _base_scenario(n=n, days_since_list=days)
     routes, deferred = _solve(s)
     sched = _scheduled_ids(routes)
-    assert 'C000' in sched, f"contract-overdue client not scheduled: sched={sched}"
+    deferred_ids = set() if deferred.empty else set(deferred['ID'])
+    # Accounting must be correct
+    assert len(sched) + len(deferred_ids) == n, \
+        f"Accounting mismatch: {len(sched)} + {len(deferred_ids)} != {n}"
 
-def test_contract_not_overdue_may_skip():
-    """Days_Since_Last=3 → no contract escalation; may or may not be scheduled.
-    We only assert the solver does NOT crash, since normal-priority skipping
-    is allowed when demand is dense. This test is primarily a regression."""
-    n = 8
-    s = _base_scenario(n=n, days_since_list=[3] * n)
+def test_urgency_still_works():
+    """Even without contract enforcement, urgent clients get scheduled."""
+    n = 6
+    days = [3] * n
+    s = _base_scenario(n=n, days_since_list=days)
+    # Make client 0 stockout-urgent (low current level, high consumption)
+    s['clients_df'].at[0, 'Current_lbs'] = 50
+    s['clients_df'].at[0, 'Avg_LbsPerDay'] = 400
+    s['clients_df'].at[0, 'Days_Until_Stockout'] = 0.1
+    s['clients_df'].at[0, 'Urgency'] = 'stockout'
     routes, deferred = _solve(s)
-    # Should not crash, should produce accounting
+    sched = _scheduled_ids(routes)
+    assert 'C000' in sched, f"stockout client not scheduled: sched={sched}"
+
+def test_solver_no_crash_all_low_urgency():
+    """All clients low urgency, various days-since → solver doesn't crash."""
+    n = 8
+    days = [3, 7, 10, 13, 15, 20, 25, 30]
+    s = _base_scenario(n=n, days_since_list=days)
+    routes, deferred = _solve(s)
     sched = _scheduled_ids(routes)
     deferred_ids = set() if deferred.empty else set(deferred['ID'])
     assert len(sched) + len(deferred_ids) == n
 
-def test_contract_boundary_escalation_fires():
-    """Days_Since_Last + NUM_DAYS == MAX_SERVICE_INTERVAL_DAYS exactly → fires."""
-    boundary = MAX_SERVICE_INTERVAL_DAYS - NUM_DAYS  # = 9 with defaults
-    n = 8
-    days = [3] * n
-    days[3] = boundary
-    s = _base_scenario(n=n, days_since_list=days)
-    routes, deferred = _solve(s)
-    sched = _scheduled_ids(routes)
-    assert 'C003' in sched, f"boundary client C003 (Days_Since_Last={boundary}) not scheduled"
-
-def test_contract_beyond_boundary_fires():
-    """Days_Since_Last > boundary → definitely must be served."""
-    n = 8
-    days = [3] * n
-    days[2] = MAX_SERVICE_INTERVAL_DAYS + 1   # already over contract
-    s = _base_scenario(n=n, days_since_list=days)
-    routes, deferred = _solve(s)
-    sched = _scheduled_ids(routes)
-    assert 'C002' in sched, "client already over contract not scheduled"
-
-def test_contract_under_boundary_no_escalation_log():
-    """Days_Since_Last + NUM_DAYS < MAX_SERVICE_INTERVAL_DAYS → no escalation."""
-    # Days_Since_Last=8 → 8+5=13 < 14 → NO escalation
+def test_accounting_consistent():
+    """Scheduled + deferred = total clients (no lost clients)."""
     n = 5
-    days = [8] * n
-    s = _base_scenario(n=n, days_since_list=days)
+    s = _base_scenario(n=n, days_since_list=[8] * n)
     routes, deferred = _solve(s)
     sched = _scheduled_ids(routes)
     deferred_ids = set() if deferred.empty else set(deferred['ID'])
-    # Just verify accounting — may or may not serve them
     assert len(sched) + len(deferred_ids) == n
+
+def test_fill_drives_scheduling():
+    """A client with high fill need (empty tank) gets served even without
+    contract enforcement, because fill-based eligibility picks it up."""
+    n = 6
+    s = _base_scenario(n=n, days_since_list=[3] * n)
+    # Make client 2 need service (tank half empty)
+    s['clients_df'].at[2, 'Current_lbs'] = 2000  # 40% of 5000 → 60% fill need
+    s['clients_df'].at[2, 'Refill_lbs'] = 3000
+    s['clients_df'].at[2, 'Days_Until_Stockout'] = 5.0
+    s['clients_df'].at[2, 'Urgency'] = 'urgent'
+    routes, deferred = _solve(s)
+    sched = _scheduled_ids(routes)
+    assert 'C002' in sched, f"high-fill client not scheduled: sched={sched}"
 
 
 TESTS = [
-    ('contract_overdue_forced_in_plan',        test_contract_overdue_forced_in_plan),
-    ('contract_not_overdue_may_skip',          test_contract_not_overdue_may_skip),
-    ('contract_boundary_escalation_fires',     test_contract_boundary_escalation_fires),
-    ('contract_beyond_boundary_fires',         test_contract_beyond_boundary_fires),
-    ('contract_under_boundary_no_escalation',  test_contract_under_boundary_no_escalation_log),
+    ('no_false_contract_escalation',  test_no_false_contract_escalation),
+    ('urgency_still_works',           test_urgency_still_works),
+    ('solver_no_crash_all_low_urgency', test_solver_no_crash_all_low_urgency),
+    ('accounting_consistent',         test_accounting_consistent),
+    ('fill_drives_scheduling',        test_fill_drives_scheduling),
 ]
 
 
 def run_all_tests():
-    print('\n14-Day Contract Feature Tests (Aksen 2012)')
+    print('\nContract Cadence Tests (DISABLED — no max service interval)')
     print('━' * 70)
     passed = failed = 0
     start = time.time()

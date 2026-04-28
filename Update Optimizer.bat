@@ -24,17 +24,26 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+:: ── Save local data changes ───────────────────────
+echo Saving any local data changes...
+git stash --include-untracked >nul 2>&1
+
 :: ── Pull latest version ───────────────────────────
 echo Downloading latest version from GitHub...
 echo   https://github.com/pabloherrer/sk_optimizer
 echo.
-git pull https://github.com/pabloherrer/sk_optimizer.git
+git pull origin main
 if %errorlevel% neq 0 (
     echo.
+    echo Restoring your local changes...
+    git stash pop >nul 2>&1
     echo Update failed. Check your internet connection.
     pause
     exit /b 1
 )
+
+:: ── Restore local data changes ───────────────────
+git stash pop >nul 2>&1
 
 :: ── Update dependencies if requirements changed ───
 echo.

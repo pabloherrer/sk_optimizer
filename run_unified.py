@@ -8,6 +8,7 @@ Usage:
     python run_unified.py --skip-validation       # Skip validation (debug)
 """
 
+import os
 import sys
 import argparse
 from pathlib import Path
@@ -25,6 +26,47 @@ from config import (
 
 # ── Plan-date utility ────────────────────────────────────────────────────────
 _WEEKDAY_SHORT = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
+def _print_stockout_risk(snapshot: pd.DataFrame, routes: dict, today: pd.Timestamp) -> None:
+    """Print the top at-risk clients and whether each is scheduled this week."""
+    if snapshot is None or snapshot.empty or 'Days_Until_Stockout' not in snapshot.columns:
+        return
+
+    # Build a set of client IDs that appear in the generated routes
+    scheduled_ids = set()
+    sched_day: dict = {}
+    for d, df in routes.items():
+        if df is None or df.empty or 'ID' not in df.columns:
+            continue
+        for _, r in df.iterrows():
+            cid = str(r.get('ID', ''))
+            scheduled_ids.add(cid)
+            if cid not in sched_day:
+                sched_day[cid] = str(r.get('Date', r.get('Day', '?')))
+
+    df = snapshot.copy()
+    df = df.sort_values('Days_Until_Stockout', na_position='last')
+    topN = df.head(15)
+
+    print('\n  At-risk clients (top 15, sorted by days-until-stockout):')
+    print(f'    {"ID":<7s} {"Customer":<26s} {"Days":>5s} {"Stockout date":<16s} {"Urg":<9s} {"Scheduled":<14s}')
+    for _, r in topN.iterrows():
+        cid = str(r.get('ID', ''))
+        cust = str(r.get('Customer', ''))[:26]
+        days = r.get('Days_Until_Stockout', float('nan'))
+        try:
+            days_s = f'{float(days):>5.1f}'
+            stk_date = (today + pd.Timedelta(days=max(float(days), 0))).strftime('%a %b %d')
+        except Exception:
+            days_s = '  n/a'
+            stk_date = '—'
+        urg = str(r.get('Urgency', ''))[:9]
+        if cid in scheduled_ids:
+            sched = f'Yes ({sched_day.get(cid, "?")})'[:14]
+        else:
+            sched = 'DEFERRED'
+        print(f'    {cid:<7s} {cust:<26s} {days_s} {stk_date:<16s} {urg:<9s} {sched:<14s}')
 
 
 def compute_plan_dates(today: pd.Timestamp, n_days: int = 5) -> List[pd.Timestamp]:
@@ -58,7 +100,7 @@ from state import load_state, initialise_state_from_snapshot
 from schema_loaders import (
     load_time_windows, load_closures, load_depot_config, load_trucks
 )
-from unified_solver import solve_week
+from unified_solver import solve_week, solve_horizon
 from output import save_excel_schedule, save_route_map
 from validator import validate_inputs
 
@@ -159,29 +201,65 @@ def main():
         state = initialise_state_from_snapshot(clients_df)
     snapshot = enrich_snapshot(clients_df, state)
 
-    # ── Compute plan dates (next N delivery days after today) ────────────
-    plan_dates = compute_plan_dates(today)
-    print(f'\n  Plan window ({len(plan_dates)} delivery days, starting from tomorrow):')
-    for i, dt in enumerate(plan_dates):
-        print(f'    Day {i + 1}: {dt.strftime("%a %b %d, %Y")}')
+    # ── Read operator overrides from env vars (set by app.py) ──────────
+    skip_ids_env = os.environ.get('SK_SKIP_IDS', '')
+    must_ids_env = os.environ.get('SK_MUST_VISIT_IDS', '')
+    active_trucks_env = os.environ.get('SK_ACTIVE_TRUCKS', '')
 
-    # ── Solve ────────────────────────────────────────────────────────────
-    print(f'\n[6/6] Running unified solver ({solve_sec}s time limit)...')
-    routes, deferred = solve_week(
-        snapshot, dm, tm, node_index_map,
-        start_day=args.start_day,
+    skip_ids = set(s.strip() for s in skip_ids_env.split(',') if s.strip()) if skip_ids_env else set()
+    must_visit_ids = set(s.strip() for s in must_ids_env.split(',') if s.strip()) if must_ids_env else set()
+    active_trucks = [s.strip() for s in active_trucks_env.split(',') if s.strip()] if active_trucks_env else None
+
+    if skip_ids:
+        print(f'  Operator overrides: {len(skip_ids)} client(s) skipped')
+    if must_visit_ids:
+        print(f'  Operator overrides: {len(must_visit_ids)} client(s) must-visit')
+    if active_trucks:
+        print(f'  Operator overrides: active trucks = {active_trucks}')
+
+    # ── Solve with rolling horizon ───────────────────────────────────────
+    from config import HORIZON_DAYS as _cfg_horizon, COMMIT_DAYS as _cfg_commit
+    horizon_days = _cfg_horizon
+    commit_days = _cfg_commit
+
+    print(f'\n[6/6] Running horizon solver ({solve_sec}s, {horizon_days}-day horizon, '
+          f'commit {commit_days})...')
+    committed, tentative, deferred = solve_horizon(
+        clients_df=snapshot,
+        dist_matrix=dm,
+        time_matrix_min=tm,
+        node_index_map=node_index_map,
+        today=today,
+        horizon_days=horizon_days,
+        commit_days=commit_days,
         solve_seconds=solve_sec,
         time_windows_df=time_windows_df,
         closures_df=closures_df,
-        today=today,
         depot_config=depot_config,
-        plan_dates=plan_dates,
+        skip_ids=skip_ids,
+        must_visit_ids=must_visit_ids,
+        active_trucks=active_trucks,
     )
+
+    # ── Merge committed + tentative for output ──────────────────────────
+    # Tag each route DataFrame so Excel/map can distinguish them
+    routes = {}
+    plan_dates = compute_plan_dates(today, n_days=horizon_days)
+    for d, df in committed.items():
+        if not df.empty:
+            df = df.copy()
+            df['Status'] = 'COMMITTED'
+        routes[d] = df
+    for d, df in tentative.items():
+        if not df.empty:
+            df = df.copy()
+            df['Status'] = 'TENTATIVE'
+        routes[d] = df
 
     # ── Output ───────────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    has_routes = any(not routes[d].empty for d in routes)
+    has_routes = any(not routes.get(d, pd.DataFrame()).empty for d in routes)
     if not has_routes:
         print('\n  ⚠  No routes generated — nothing to save.')
         return
@@ -198,15 +276,18 @@ def main():
         if 'Route_Dist_km' not in df.columns and 'Route_Dist_mi' in df.columns:
             df['Route_Dist_km'] = round(df['Route_Dist_mi'] * 1.60934, 1)
 
+    # Print stockout-risk preview (top 15) — use all routes
+    _print_stockout_risk(snapshot, routes, today)
+
     # Save Excel
     excel_name = f'{prefix}_schedule.xlsx'
     save_excel_schedule(
         routes, deferred, filename=excel_name, output_dir=OUTPUT_DIR,
-        plan_dates=plan_dates, today=today,
+        plan_dates=plan_dates, today=today, snapshot=snapshot,
     )
     print(f'\n  Excel → {OUTPUT_DIR / excel_name}')
 
-    # Save map
+    # Save map (all routes — committed + tentative; map has day toggles)
     map_name = f'{prefix}_map.html'
     save_route_map(routes, filename=map_name, output_dir=OUTPUT_DIR)
     print(f'  Map   → {OUTPUT_DIR / map_name}')
