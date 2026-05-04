@@ -115,6 +115,22 @@ def run_daily(
         state = update_state(state, clients_df, [], n_days_elapsed=1)
         save_state(state, STATE_FILE)
 
+    # ── Anova sensor override ───────────────────────────────────────────
+    # Overwrite estimated state with live sensor data for clients with
+    # fresh (< 24h) readings. Graceful fallback if data is unavailable.
+    try:
+        from anova_fetch import load_anova_latest
+        anova = load_anova_latest()
+        n_overrides = 0
+        for cid, reading in anova.get('readings', {}).items():
+            if reading.get('age_hours', 999) <= 24.0:
+                state[cid] = float(reading['level_lbs'])
+                n_overrides += 1
+        if n_overrides:
+            print(f'  ▸ Anova: {n_overrides} client(s) using live sensor levels')
+    except Exception as e:
+        print(f'  ⚠ Anova override skipped: {e}')
+
     # ── Enrich snapshot with current state ──────────────────────────────
     # Overlay persisted state onto the delivery-log estimates
     for i, row in clients_df.iterrows():

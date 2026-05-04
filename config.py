@@ -6,7 +6,7 @@ nothing else in the codebase needs to be edited for routine tuning.
 """
 
 from pathlib import Path
-import sys, os
+import sys, os, json
 
 # ── Force UTF-8 on Windows (prevents CP1252 crash with Unicode chars) ────────
 if sys.platform == 'win32':
@@ -23,7 +23,25 @@ BASE_DIR   = Path(__file__).parent
 DATA_DIR   = BASE_DIR / 'data'
 OUTPUT_DIR = BASE_DIR / 'output'
 
-INPUT_FILE  = DATA_DIR / 'SK_Delivery_System.xlsx'
+# ── Per-machine settings (local_config.json — gitignored) ────────────────────
+LOCAL_CONFIG_FILE = BASE_DIR / 'local_config.json'
+_local_cfg = {}
+if LOCAL_CONFIG_FILE.exists():
+    try:
+        _local_cfg = json.loads(LOCAL_CONFIG_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+
+def save_local_config(cfg: dict):
+    """Write per-machine settings that persist across updates."""
+    LOCAL_CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+
+# SK_INPUT_FILE: env var → local_config.json → default
+INPUT_FILE = Path(
+    os.environ.get('SK_INPUT_FILE')
+    or _local_cfg.get('input_file')
+    or str(DATA_DIR / 'SK_Delivery_System.xlsx')
+)
 MATRIX_FILE = DATA_DIR / 'osrm_full_matrix_with_ids.npz'
 NODES_FILE  = DATA_DIR / 'osrm_nodes_used_with_ids.csv'
 STATE_FILE  = DATA_DIR / 'inventory_state.json'
@@ -54,9 +72,13 @@ TRUCK_NAMES = list(TRUCKS.keys())   # ['Truck2', 'Truck9']
 NUM_TRUCKS  = len(TRUCK_NAMES)
 
 # ── Saturday fleet ───────────────────────────────────────────────────────────
-# One truck always runs Tucson/Flagstaff on Saturdays, leaving only one truck
-# for the metro route. The solver will auto-restrict Saturday to this list.
-SATURDAY_TRUCKS = ['Truck2']        # Only Truck2 available for metro Saturdays
+# Every Saturday Truck9 runs the long out-of-metro route — alternating
+# Tucson one week and Flagstaff the next. So for metro planning the rule
+# is simple: Saturday = Truck2-only. The Tucson/Flagstaff alternation
+# only matters for which clients in the EXCLUDED list are visited that week
+# (Tucson clients alt Sat, Flagstaff clients the other Sat). The metro
+# optimizer doesn't see those clients regardless.
+SATURDAY_TRUCKS = ['Truck2']        # Only Truck2 on metro Saturdays
 
 # ── Work week ─────────────────────────────────────────────────────────────────
 DAYS     = ['Tue', 'Wed', 'Thu', 'Fri', 'Sat']
@@ -72,7 +94,12 @@ OVERTIME_MIN  = 480   # Early soft cap: target return 2 PM (8 hours); penalise a
 # from an extra stop. Expressed in the same integer cost units as distance.
 OT_MULTIPLIER        = 1.5    # 1.5x base labor rate for minutes over SHIFT_MIN
 LABOR_COST_PER_MIN   = 50     # Base labor cost units per minute (≈ $30/hr driver → 50 units/min)
-OT_PENALTY_PER_MIN   = int(LABOR_COST_PER_MIN * (OT_MULTIPLIER - 1.0))  # = 25: the *extra* cost per OT minute
+# OT penalty has been bumped from 25 to 200/min to discourage the solver
+# from cramming 14+ stops onto day 0 (which produces 11h40 overtime shifts
+# and geographically spread routes). At 200/min, a 100-min overtime costs
+# 20,000 cost units — comparable to a 12-mile detour. The solver will now
+# prefer to spread stops across the horizon rather than overtime day 0.
+OT_PENALTY_PER_MIN   = 200
 
 # ── Deadline-coupled routing (ADR-001) ───────────────────────────────────────
 # Lateness penalty: cost units added per day a client is served past their
@@ -148,6 +175,29 @@ OPPORTUNISTIC_FILL_PCT = 0.55  # Opportunistic backfill: if truck is already nea
                                 # 50 % = tank at least half empty → meaningful delivery.
                                 # Below 50 % the pump time may not justify the stop.
 
+# ── Neighbor-sweep: cross-day cluster cohesion (Apr 2026) ────────────────────
+# Problem the sweep solves: the unified solver computes a per-client "preferred
+# day" from each client's own fill economics, so clients in the same micro-area
+# can land on different days when their consumption rates differ. This sends
+# trucks back to the same neighborhood multiple times a week. Concrete case:
+# DILLONS BAYOU (Peoria, preferred Sat) and TAILGATERS / SARDELLA'S LAKE
+# PLEASANT (Peoria, preferred Wed) — same parkway, three trips, two days.
+#
+# How the sweep works: after each client's base preferred day is computed,
+# we look at neighbors within NEIGHBOR_SWEEP_RADIUS_MI. If a neighbor has an
+# earlier preferred day AND visiting this client on that earlier day is
+# feasible (won't stock out + fill ≥ NEIGHBOR_SWEEP_MIN_FILL), we pull this
+# client's preferred day earlier. The pull is one-directional (earlier only)
+# so we never push a client TOWARD a stockout. Mandatory clients are skipped.
+#
+# Default radius 12 mi is intentionally generous — covers the case where a
+# parkway-cluster spans ~10 mi (e.g., DILLONS BAYOU at 87th Ave to TAILGATERS
+# LAKE PLEASANT at 101st Ave). Tighten to 6–8 mi for more conservative behavior.
+NEIGHBOR_SWEEP_ENABLED   = True
+NEIGHBOR_SWEEP_RADIUS_MI = 12.0   # Max haversine miles between neighbors
+NEIGHBOR_SWEEP_MIN_FILL  = 0.20   # Don't pull a client whose tank would be <20% empty
+                                  # on the target day — refill not worth the pump time
+
 # ── Scoring / objective weights ───────────────────────────────────────────────
 # Phase-1 visit score:
 #   score(i,d) = fill_efficiency × account_weight × urgency_multiplier
@@ -201,7 +251,9 @@ HORIZON_BUFFER  = 3    # Days past horizon end to check for looming stockouts.
 SOLVE_SEC      = 90    # Time limit per day-solve (seconds) — legacy per-day
 SOLVE_SEC_WEEK = 600   # Unified solver: 10 min default for 10-day/60-vehicle horizon
                        # (was 300 for 5-day/30-vehicle; doubled for 2x vehicles)
-SOLUTION_LIMIT = 1_000 # Early-stop if solver finds this many improving solutions
+SOLUTION_LIMIT = 0     # 0 = disabled: solver runs until SOLVE_SEC_WEEK time limit.
+                       # Set to a positive integer (e.g., 1000) to early-stop after
+                       # that many improving solutions found.
 
 # OR-Tools strategy overrides (string names, read via getattr on routing_enums_pb2).
 # Valid FirstSolutionStrategy names include: PATH_CHEAPEST_ARC, PATH_MOST_CONSTRAINED_ARC,
@@ -244,15 +296,25 @@ METERS_PER_MILE = 1609.34
 TRUCK_SPEED_FACTOR = 1.25
 
 # ── Excluded regions ─────────────────────────────────────────────────────────
-# Tucson & Flagstaff are on a separate bi-weekly Saturday run.
-# These clients are excluded from the weekly optimizer entirely.
+# Far-cluster clients are on the alternating Saturday far-runs (Tucson
+# one week, Flagstaff the next). They are NOT routed by the metro
+# optimizer. Lake Pleasant / Cave Creek / Peoria-edge clients (lat ~33.6–33.85)
+# are KEPT in the metro pool — they're long drives but reachable in a day.
 EXCLUDED_CLIENT_IDS: set = {
-    # Flagstaff area (lat ~35.x) — bi-weekly Saturday run
+    # ── Flagstaff Saturday (lat ~35.x) ───────────────────────────────
     '11005',  # Karma Sushi
     '12021',  # Lotus Lounge
     '15032',  # Oregano Country
     '15004',  # Oregano Flagstaff
-    # Tucson / Casa Grande area (lat ~32.x) — bi-weekly Saturday run
+    # ── Prescott (lat ~34.5) — en route to Flagstaff, handled by far run ──
+    '16052',  # The Palace Saloon
+    '20089',  # Tailgaters Prescott
+    # ── New River (lat ~33.92) — on I-17 north, picked up on Flagstaff run ──
+    '18036',  # Roadrunner Saloon
+    # NOTE: Wickenburg (18042 Rancho Bar 7, 3028 Cowboy Cookin) stay in
+    # metro per ops — reachable from Phoenix in a day, not on the
+    # Flagstaff route.
+    # ── Tucson / Casa Grande Saturday (lat ~32.x) ────────────────────
     '1057',   # Angry Crab Tucson
     '10012',  # Jay Travel Center
     '15033',  # Oregano Landing

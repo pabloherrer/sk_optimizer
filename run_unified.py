@@ -199,6 +199,24 @@ def main():
     if not state:
         print('  No prior state — initialising from delivery-log estimates.')
         state = initialise_state_from_snapshot(clients_df)
+
+    # ── Anova sensor override ────────────────────────────────────────────
+    # For clients with fresh (< 24h) sensor readings, overwrite the
+    # estimated tank level with the observed level. Graceful fallback if
+    # the file is missing or stale.
+    try:
+        from anova_fetch import load_anova_latest
+        anova = load_anova_latest()
+        n_overrides = 0
+        for cid, reading in anova.get('readings', {}).items():
+            if reading.get('age_hours', 999) <= 24.0:
+                state[cid] = float(reading['level_lbs'])
+                n_overrides += 1
+        if n_overrides:
+            print(f'  ▸ Anova: {n_overrides} client(s) using live sensor levels')
+    except Exception as e:
+        print(f'  ⚠ Anova override skipped: {e}')
+
     snapshot = enrich_snapshot(clients_df, state)
 
     # ── Read operator overrides from env vars (set by app.py) ──────────

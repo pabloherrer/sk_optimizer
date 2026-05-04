@@ -23,15 +23,23 @@ def load_time_windows(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
     """
     Load Client_Time_Windows sheet.
 
-    Returns DataFrame with columns:
-      - Client_ID (str)
-      - Day_of_Week (str: Mon, Tue, Wed, Thu, Fri, Sat, Sun)
-      - Open_Min (int: minutes since midnight)
-      - Close_Min (int: minutes since midnight)
+    Schema (one row per rule, human-friendly):
+      Col 1: Client_ID
+      Col 2: Customer (name; for human readability — ignored by code)
+      Col 3: Day_of_Week — 'Tue' / 'Wed' / ... / 'Sat'  OR  'All' / '*' /
+             empty to mean every workday
+      Col 4: Open_HHMM    e.g. '9:00'
+      Col 5: Close_HHMM   e.g. '10:00'
+      Col 6: Notes (optional, free text)
 
-    Skips rows where Client_ID starts with 'EXAMPLE_'.
-    Returns empty DataFrame if sheet is missing or has no data.
+    Backwards-compat: also accepts the legacy 4-column format
+    (Client_ID, Day_of_Week, Open, Close) by detecting whether col 4
+    looks like an HH:MM string vs a customer name.
+
+    Loader EXPANDS 'All'/'*'/empty to all workdays, returning one row
+    per (client, day) pair as before.
     """
+    workdays = ['Tue', 'Wed', 'Thu', 'Fri', 'Sat']
     try:
         wb = load_workbook(str(input_file), data_only=True)
         if 'Client_Time_Windows' not in wb.sheetnames:
@@ -41,34 +49,57 @@ def load_time_windows(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
         records = []
 
         for row in ws.iter_rows(min_row=4, values_only=True):
-            # Skip if empty or starts with EXAMPLE_
             if not row[0]:
                 continue
             client_id = str(row[0]).strip()
             if client_id.startswith('EXAMPLE_'):
                 continue
 
-            # Parse day and times
-            day = str(row[1]).strip() if row[1] else None
-            open_hhmm = str(row[2]).strip() if row[2] else None
-            close_hhmm = str(row[3]).strip() if row[3] else None
+            # Detect schema version. New schema: col 2 = customer name (free text);
+            # col 3 = day; col 4 = open; col 5 = close. Legacy: col 2 = day;
+            # col 3 = open; col 4 = close. Distinguish by checking whether col 3
+            # looks like an HH:MM time.
+            new_schema = False
+            col3 = row[2] if len(row) > 2 else None
+            if col3 is not None:
+                col3_str = str(col3).strip()
+                # If col 3 is HH:MM-ish and col 4 is too → legacy schema
+                if ':' in col3_str and len(row) > 3 and row[3] and ':' in str(row[3]):
+                    new_schema = False
+                else:
+                    new_schema = True
 
-            if not (day and open_hhmm and close_hhmm):
+            if new_schema:
+                day_raw   = str(row[2]).strip() if row[2] else ''
+                open_raw  = str(row[3]).strip() if len(row) > 3 and row[3] else ''
+                close_raw = str(row[4]).strip() if len(row) > 4 and row[4] else ''
+            else:
+                day_raw   = str(row[1]).strip() if row[1] else ''
+                open_raw  = str(row[2]).strip() if row[2] else ''
+                close_raw = str(row[3]).strip() if row[3] else ''
+
+            if not (open_raw and close_raw):
                 continue
 
             try:
-                open_min = _time_to_min(open_hhmm)
-                close_min = _time_to_min(close_hhmm)
+                open_min  = _time_to_min(open_raw)
+                close_min = _time_to_min(close_raw)
+            except ValueError:
+                continue
 
+            day_upper = day_raw.upper()
+            if day_upper in ('', 'ALL', '*', 'ANY', 'EVERY', 'WEEKDAY', 'WEEKDAYS'):
+                days_to_apply = workdays
+            else:
+                days_to_apply = [day_raw]
+
+            for d in days_to_apply:
                 records.append({
                     'Client_ID': client_id,
-                    'Day_of_Week': day,
+                    'Day_of_Week': d,
                     'Open_Min': open_min,
                     'Close_Min': close_min,
                 })
-            except ValueError:
-                # Skip malformed time entries
-                continue
 
         return pd.DataFrame(records)
     except Exception:
@@ -79,19 +110,28 @@ def load_closures(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
     """
     Load Client_Closures sheet.
 
-    Returns DataFrame with columns:
-      - Client_ID (str)
-      - Start_Date (pd.Timestamp)
-      - End_Date (pd.Timestamp)
-      - Reason (str)
+    Schema (one row per rule, human-friendly):
+      Col 1: Client_ID
+      Col 2: Customer (name; for human readability — ignored by code)
+      Col 3: Recurring_DOW — 'Tue' / 'Wed' / ... / 'Sat'  OR empty.
+             If set: applies every week on that weekday (no need to list
+             individual dates).
+      Col 4: Start_Date  (only used if Recurring_DOW is empty)
+      Col 5: End_Date    (only used if Recurring_DOW is empty)
+      Col 6: Reason
 
-    Skips rows where Client_ID starts with 'EXAMPLE_'.
-    Returns empty DataFrame if sheet is missing or has no data.
+    Backwards-compat: legacy 4-col format
+      (Client_ID, Start_Date, End_Date, Reason)
+    is also accepted — detected by whether col 2 is a date or a name.
+
+    Returns DataFrame columns:
+      Client_ID, Start_Date, End_Date, Recurring_DOW, Reason
     """
     try:
         wb = load_workbook(str(input_file), data_only=True)
         if 'Client_Closures' not in wb.sheetnames:
-            return pd.DataFrame(columns=['Client_ID', 'Start_Date', 'End_Date', 'Reason'])
+            return pd.DataFrame(columns=['Client_ID', 'Start_Date', 'End_Date',
+                                         'Recurring_DOW', 'Reason'])
 
         ws = wb['Client_Closures']
         records = []
@@ -103,35 +143,51 @@ def load_closures(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
             if client_id.startswith('EXAMPLE_'):
                 continue
 
-            start_date = row[1]
-            end_date = row[2]
-            reason = str(row[3]).strip() if row[3] else ''
+            # Detect schema. New: col 2 = customer (text). Legacy: col 2 = date.
+            col2 = row[1] if len(row) > 1 else None
+            new_schema = isinstance(col2, str) or col2 is None
 
-            # Parse dates robustly
-            try:
-                if isinstance(start_date, str):
-                    start_date = pd.Timestamp(start_date)
-                else:
-                    start_date = pd.Timestamp(start_date.date() if hasattr(start_date, 'date') else start_date)
+            if new_schema:
+                rec_dow_raw = str(row[2]).strip() if len(row) > 2 and row[2] else ''
+                start_date  = row[3] if len(row) > 3 else None
+                end_date    = row[4] if len(row) > 4 else None
+                reason      = str(row[5]).strip() if len(row) > 5 and row[5] else ''
+            else:
+                rec_dow_raw = ''
+                start_date  = row[1]
+                end_date    = row[2]
+                reason      = str(row[3]).strip() if row[3] else ''
 
-                if isinstance(end_date, str):
-                    end_date = pd.Timestamp(end_date)
-                else:
-                    end_date = pd.Timestamp(end_date.date() if hasattr(end_date, 'date') else end_date)
+            rec_dow_norm = rec_dow_raw[:3].title() if rec_dow_raw else ''
+            if rec_dow_norm not in ('', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'):
+                rec_dow_norm = ''
 
-                records.append({
-                    'Client_ID': client_id,
-                    'Start_Date': start_date,
-                    'End_Date': end_date,
-                    'Reason': reason,
-                })
-            except (ValueError, AttributeError):
-                # Skip rows with unparseable dates
-                continue
+            # If recurring DOW is set, dates are optional (use sentinels)
+            if rec_dow_norm:
+                start_date_p = pd.Timestamp('1970-01-01')
+                end_date_p   = pd.Timestamp('2099-12-31')
+            else:
+                # Date range required for non-recurring closures
+                if start_date is None or end_date is None:
+                    continue
+                try:
+                    start_date_p = pd.Timestamp(start_date)
+                    end_date_p   = pd.Timestamp(end_date)
+                except (ValueError, AttributeError, TypeError):
+                    continue
+
+            records.append({
+                'Client_ID':     client_id,
+                'Start_Date':    start_date_p,
+                'End_Date':      end_date_p,
+                'Recurring_DOW': rec_dow_norm,
+                'Reason':        reason,
+            })
 
         return pd.DataFrame(records)
     except Exception:
-        return pd.DataFrame(columns=['Client_ID', 'Start_Date', 'End_Date', 'Reason'])
+        return pd.DataFrame(columns=['Client_ID', 'Start_Date', 'End_Date',
+                                     'Recurring_DOW', 'Reason'])
 
 
 def load_trucks(input_file: str | Path = INPUT_FILE) -> dict:
@@ -308,42 +364,47 @@ def is_client_open(client_id: str, day_name: str, arrival_min: int,
     return row['Open_Min'] <= arrival_min < row['Close_Min']
 
 
+_WEEKDAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+
 def is_client_closed_on(client_id: str, date, closures_df: pd.DataFrame) -> bool:
     """
-    Check if a client is closed (due to closure) on a given date.
+    Check if a client is closed on a given date. Handles BOTH:
+      • Date-range closures (Start_Date ≤ date ≤ End_Date)
+      • Recurring weekday closures (Recurring_DOW matches date.weekday())
 
-    Parameters
-    ----------
-    client_id : str
-        Client ID (e.g., 'C001')
-    date : str, datetime, or Timestamp
-        Date to check (YYYY-MM-DD or datetime object)
-    closures_df : pd.DataFrame
-        Result from load_closures()
-
-    Returns
-    -------
-    bool
-        True if closures_df contains a row covering date for client_id.
+    Returns True if any closure rule covers (client_id, date).
     """
     if closures_df.empty:
         return False
 
-    # Normalize date to Timestamp
     if isinstance(date, str):
         date = pd.Timestamp(date)
     elif hasattr(date, 'date'):
         date = pd.Timestamp(date.date())
     else:
         date = pd.Timestamp(date)
+    weekday_short = _WEEKDAY_NAMES[date.weekday()]
 
-    match = closures_df[
-        (closures_df['Client_ID'] == client_id) &
-        (closures_df['Start_Date'] <= date) &
-        (date <= closures_df['End_Date'])
+    # Match this client's rows
+    rows = closures_df[closures_df['Client_ID'] == client_id]
+    if rows.empty:
+        return False
+
+    # Recurring weekday rule
+    if 'Recurring_DOW' in rows.columns:
+        rec = rows[rows['Recurring_DOW'] == weekday_short]
+        if not rec.empty:
+            return True
+
+    # Date-range rule
+    in_range = rows[
+        (rows['Start_Date'] <= date) & (date <= rows['End_Date'])
     ]
-
-    return len(match) > 0
+    # If the row has a Recurring_DOW, the date range is sentinel — skip those
+    if 'Recurring_DOW' in in_range.columns:
+        in_range = in_range[in_range['Recurring_DOW'] == '']
+    return len(in_range) > 0
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -48,7 +48,7 @@ from config import (
 import config as _cfg
 from inventory import (
     compute_refill, fill_efficiency, days_until_stockout,
-    project_level, urgency_tier,
+    project_level, project_level_dow, urgency_tier,
 )
 from schema_loaders import is_client_open, is_client_closed_on
 
@@ -291,7 +291,8 @@ def compute_horizon_dates(
 
     Parameters
     ----------
-    today        : The current planning date (afternoon of this day).
+    today        : The current planning date. INCLUDED in the plan if
+                   it's a workday — "today" is the first day we plan FOR.
     horizon_days : How many working days to include (default from config).
     work_days    : Set of weekday short-names (default from config.DAYS).
     """
@@ -301,7 +302,7 @@ def compute_horizon_dates(
         work_days = set(DAYS)
 
     dates: List[pd.Timestamp] = []
-    cur = pd.Timestamp(today).normalize() + pd.Timedelta(days=1)
+    cur = pd.Timestamp(today).normalize()
     for _ in range(60):   # hard safety cap
         if len(dates) >= horizon_days:
             break
@@ -326,6 +327,7 @@ def solve_horizon(
     skip_ids:        Optional[Set[str]] = None,
     must_visit_ids:  Optional[Set[str]] = None,
     active_trucks:   Optional[List[str]] = None,
+    initial_routes_by_vehicle: Optional[Dict[int, List[str]]] = None,
 ) -> Tuple[Dict[int, pd.DataFrame], Dict[int, pd.DataFrame], pd.DataFrame]:
     """
     Rolling-horizon solver (Campbell & Savelsbergh 2004).
@@ -401,6 +403,7 @@ def solve_horizon(
         skip_ids=skip_ids,
         must_visit_ids=must_visit_ids,
         active_trucks=active_trucks,
+        initial_routes_by_vehicle=initial_routes_by_vehicle,
     )
 
     # Split into committed and tentative
@@ -440,6 +443,7 @@ def solve_week(
     skip_ids:          Optional[Set[str]] = None,
     must_visit_ids:    Optional[Set[str]] = None,
     active_trucks:     Optional[List[str]] = None,
+    initial_routes_by_vehicle: Optional[Dict[int, List[str]]] = None,
 ) -> Tuple[Dict[int, pd.DataFrame], pd.DataFrame]:
     """
     Solve a multi-day horizon in one OR-Tools call.
@@ -532,6 +536,14 @@ def solve_week(
             deferred_reasons[cid] = ('NO_CONSUMPTION_DATA', 'No delivery history and no fallback rate')
             continue
 
+        # Do_Not_Schedule (per-client manual flag from Client_List sheet)
+        # Source of truth: a 'Y' in the Do_Not_Schedule column means
+        # "irregular service — handle manually, do not auto-route."
+        dns = row.get('Do_Not_Schedule')
+        if dns is not None and not pd.isna(dns) and str(dns).strip().upper() in ('Y', 'YES', '1', 'TRUE'):
+            deferred_reasons[cid] = ('DO_NOT_SCHEDULE', 'Marked Do_Not_Schedule in Client_List')
+            continue
+
     # Check for full-week closures
     for idx, row in clients_df.iterrows():
         cid = row['ID']
@@ -573,6 +585,63 @@ def solve_week(
         empty = {d: pd.DataFrame() for d in range(start_day, _npd)}
         return empty, clients_df.copy()
 
+    # ── Multi-visit expansion for high-consumers ───────────────────────
+    # A high-consumer (cycle ≤ 0.7 × horizon, tank ≥ 700 lbs) gets a
+    # SECOND virtual visit slot in the plan. Both copies of HAROLDS
+    # (cycle ~6 days, horizon 10 days) need to be visited or the tank
+    # runs dry before horizon end.
+    #
+    # Constraint: copy 1 cannot be scheduled before day = ceil(cycle * 0.7).
+    # For HAROLDS cycle 6 → copy 1 forbidden on days 0-3, allowed day 4+.
+    # (Previous bug: int(cycle * 0.5) truncated 2.98 → 2, allowing copy 1
+    # on day 2. Fixed by using ceil + 70% of cycle so visits are
+    # genuinely a half-cycle+ apart.)
+    pool['_visit_copy'] = 0
+    pool['_orig_id'] = pool['ID'].astype(str)
+    pool_meta['_orig_id'] = pool['_orig_id']
+
+    enable_multi_visit = bool(getattr(_cfg, 'ENABLE_MULTI_VISIT_PER_HORIZON', True))
+    multi_visit_added = 0
+    if enable_multi_visit and _npd >= 7:
+        extras = []
+        extras_meta = []
+        for i, row in pool.iterrows():
+            tank = float(row.get('Tank_lbs', 0) or 0)
+            rate = float(row.get('Avg_LbsPerDay', 0) or 0)
+            if tank <= 0 or rate <= 0:
+                continue
+            cycle_days = tank / rate
+            if cycle_days >= _npd * 0.70:
+                continue
+            if tank < 700:
+                continue
+            extra = row.copy()
+            extra['_visit_copy'] = 1
+            extras.append(extra)
+            extras_meta.append(pool_meta.iloc[i].copy())
+            multi_visit_added += 1
+
+        if extras:
+            pool = pd.concat([pool, pd.DataFrame(extras)], ignore_index=True)
+            pool_meta = pd.concat([pool_meta, pd.DataFrame(extras_meta)],
+                                  ignore_index=True)
+            print(f"  Multi-visit expansion: {multi_visit_added} high-consumer "
+                  f"client(s) get a second virtual visit slot")
+            # We'll forbid copy-1 from being scheduled before its earliest
+            # useful day (cycle_days from now); that block lives later in
+            # the routing model after vehicles are created. Stash the
+            # min-day-per-copy here for that step.
+            pool['_min_day'] = 0
+            for i in pool.index[pool['_visit_copy'] >= 1]:
+                tank_i = float(pool.at[i, 'Tank_lbs'])
+                rate_i = float(pool.at[i, 'Avg_LbsPerDay'])
+                cycle_i = tank_i / rate_i if rate_i > 0 else _npd
+                # Copy 1 cannot start before 70% of a tank cycle has
+                # elapsed since (presumed) copy-0 visit at day 0.
+                # Use math.ceil to avoid the int() truncation that
+                # previously let copy 1 land on day 2 (Tue+Thu HAROLDS).
+                pool.at[i, '_min_day'] = max(math.ceil(cycle_i * 0.7), 2)
+
     # ── Operator overrides: determine active truck set ───────────────────
     _active_truck_names = active_trucks if active_trucks else TRUCK_NAMES
     _n_trucks = len(_active_truck_names)
@@ -590,10 +659,8 @@ def solve_week(
     n_vehicles = _n_trucks * _npd * NUM_CONFIGS
 
     # ── Saturday fleet restriction ──────────────────────────────────────
-    # On Saturdays one truck runs the Tucson/Flagstaff route (excluded from
-    # the optimizer). Only SATURDAY_TRUCKS are available for metro stops.
-    # We track which vehicles are disabled so we can zero their capacity and
-    # fix them to empty routes in the OR-Tools model.
+    # Every Saturday Truck9 is on the long out-of-metro run (Tucson one
+    # week, Flagstaff the next). Metro Saturdays = Truck2 only.
     _sat_trucks = getattr(_cfg, 'SATURDAY_TRUCKS', SATURDAY_TRUCKS)
     _saturday_disabled_vehicles: Set[int] = set()
     if plan_dates:
@@ -608,8 +675,8 @@ def solve_week(
                         for d in range(min(_npd, len(plan_dates)))
                         if plan_dates[d].day_name() == 'Saturday']
             disabled_trucks = [t for t in _active_truck_names if t not in _sat_trucks]
-            print(f"  Saturday mode: {', '.join(disabled_trucks)} disabled on "
-                  f"{', '.join(sat_days)} ({len(_saturday_disabled_vehicles)} vehicles zeroed)")
+            print(f"  Saturday mode: {', '.join(disabled_trucks)} on far-cluster run "
+                  f"({', '.join(sat_days)}) — {len(_saturday_disabled_vehicles)} vehicles zeroed")
 
     # ── Per-day projected refills & urgency ──────────────────────────────
     # Each planning day is N days into the future.  Project each client's
@@ -635,11 +702,35 @@ def solve_week(
             cur  = float(row['Current_lbs'])
             rate = float(row['Avg_LbsPerDay'])
             tank = float(row['Tank_lbs'])
+            visit_copy = int(row.get('_visit_copy', 0))
 
-            projected_level = project_level(cur, rate, days_ahead, tank)
-            refill = max(int(round(tank - projected_level)), 0)
-            dte    = days_until_stockout(projected_level, rate, tank)
-            urg    = urgency_tier(dte)
+            if visit_copy == 0:
+                # First visit: refill from current state forward
+                rate_by_dow = row.get('Rate_By_DOW') if 'Rate_By_DOW' in pool.columns else None
+                if rate_by_dow is not None and isinstance(rate_by_dow, (list, tuple)) and len(rate_by_dow) == 7:
+                    anchor = today or pd.Timestamp.today().normalize()
+                    projected_level = project_level_dow(
+                        cur, list(rate_by_dow), anchor, days_ahead, tank,
+                    )
+                else:
+                    projected_level = project_level(cur, rate, days_ahead, tank)
+                refill = max(int(round(tank - projected_level)), 0)
+                dte    = days_until_stockout(projected_level, rate, tank)
+            else:
+                # Second visit: assume copy 0 was visited at day 0 (tank
+                # filled to 100%). Refill at day d = d × rate (capped at
+                # tank). This is 0 at day 0 (no-op) and grows to a full
+                # tank by cycle_days. The solver only finds value for
+                # this copy late in the horizon.
+                cycle_days = (tank / rate) if rate > 0 else 999
+                refill = int(round(min(days_ahead * rate, tank)))
+                # If we're earlier than half a cycle in, this copy is wasteful
+                if days_ahead < cycle_days * 0.5:
+                    refill = 0
+                # DTE for copy 1: assume tank was just filled at day 0,
+                # so DTE = cycle_days - days_ahead from now.
+                dte = max(cycle_days - days_ahead, 0)
+            urg = urgency_tier(dte)
 
             day_refills.append(refill)
             day_dte.append(dte)
@@ -810,35 +901,95 @@ def solve_week(
 
         n_tw_applied = 0
         n_day_restricted = 0
-        pool_ids = pool['ID'].tolist()
-        id_to_pool_idx = {cid: i for i, cid in enumerate(pool_ids)}
+        # cid → list of pool indices (multi-visit copies share an ID)
+        id_to_pool_idxs: dict = {}
+        for i, cid in enumerate(pool['ID'].tolist()):
+            id_to_pool_idxs.setdefault(str(cid), []).append(i)
 
         for cid, windows in tw_by_client.items():
-            if cid not in id_to_pool_idx:
-                continue   # client not in this week's pool — skip
-            pool_i = id_to_pool_idx[cid]
-            ni     = manager.NodeToIndex(pool_i + 1)   # +1 because depot is 0
+            cid_str = str(cid)
+            if cid_str not in id_to_pool_idxs:
+                continue
+            pool_idxs = id_to_pool_idxs[cid_str]
 
-            # Union envelope: widest open, narrowest close across this client's
-            # days. This is conservative: a visit will satisfy the union
-            # envelope AND the per-day vehicle restriction together.
-            widest_open   = min(w[1] for w in windows)
+            widest_open    = min(w[1] for w in windows)
             narrowest_close = max(w[2] for w in windows)
-            time_dim.CumulVar(ni).SetRange(int(widest_open), int(narrowest_close))
-            n_tw_applied += 1
+            allowed_days   = {w[0] for w in windows}
 
-            # Forbid vehicles whose day-index isn't in the client's window set.
-            allowed_days = {w[0] for w in windows}
-            if len(allowed_days) < _npd:
-                for v in range(n_vehicles):
-                    _, day_idx, _ = _v2tdc(v)
-                    if day_idx not in allowed_days:
-                        routing.VehicleVar(ni).RemoveValue(v)
-                n_day_restricted += 1
+            for pool_i in pool_idxs:
+                ni = manager.NodeToIndex(pool_i + 1)
+                time_dim.CumulVar(ni).SetRange(int(widest_open), int(narrowest_close))
+                n_tw_applied += 1
+                if len(allowed_days) < _npd:
+                    for v in range(n_vehicles):
+                        _, day_idx, _ = _v2tdc(v)
+                        if day_idx not in allowed_days:
+                            routing.VehicleVar(ni).RemoveValue(v)
+                    n_day_restricted += 1
 
         if n_tw_applied:
             print(f"\n  Time windows: applied to {n_tw_applied} client(s) "
                   f"({n_day_restricted} with day-restrictions)")
+
+    # ── Per-day closure enforcement ─────────────────────────────────────
+    # A client that is fully-closed on all work days is already deferred
+    # earlier (CLOSED_ALL_WEEK). PARTIAL closures (e.g. closed Mon–Wed
+    # only) need to forbid those specific vehicles per pool node.
+    # Multi-visit clients have duplicate pool entries (same Client_ID,
+    # different _visit_copy), so we group by ID and apply the closure
+    # to ALL copies.
+    if closures_df is not None and not closures_df.empty and plan_dates:
+        n_partial_closure = 0
+        n_partial_closure_days = 0
+        # cid → list of pool indices (one per visit copy)
+        id_to_pool_idxs: dict = {}
+        for i, cid in enumerate(pool['ID'].tolist()):
+            id_to_pool_idxs.setdefault(str(cid), []).append(i)
+
+        for cid, pool_idxs in id_to_pool_idxs.items():
+            closed_day_indices = [
+                d for d in range(_npd)
+                if d < len(plan_dates)
+                and is_client_closed_on(cid, plan_dates[d], closures_df)
+            ]
+            if not closed_day_indices:
+                continue
+            if len(closed_day_indices) >= _npd:
+                continue   # already deferred as CLOSED_ALL_WEEK earlier
+
+            for pool_i in pool_idxs:
+                ni = manager.NodeToIndex(pool_i + 1)
+                for v in range(n_vehicles):
+                    _, day_idx, _ = _v2tdc(v)
+                    if day_idx in closed_day_indices:
+                        routing.VehicleVar(ni).RemoveValue(v)
+            n_partial_closure += 1
+            n_partial_closure_days += len(closed_day_indices) * len(pool_idxs)
+
+        if n_partial_closure:
+            print(f"  Partial closures: {n_partial_closure} client(s) blocked from "
+                  f"{n_partial_closure_days} closure-day(s)")
+
+    # ── Multi-visit copy day restrictions ───────────────────────────────
+    # The "second visit" copies are useful only after a half-cycle has
+    # passed; visiting them too early means refilling a near-full tank
+    # (wasted truck-time). Forbid copy-1 from being assigned to vehicles
+    # for days < its `_min_day`.
+    if '_min_day' in pool.columns:
+        n_copy1_blocked = 0
+        for i in pool.index[pool.get('_visit_copy', 0) >= 1]:
+            min_day = int(pool.at[i, '_min_day'])
+            if min_day <= 0:
+                continue
+            ni = manager.NodeToIndex(i + 1)   # +1 because depot is 0
+            for v in range(n_vehicles):
+                _, day_idx, _ = _v2tdc(v)
+                if day_idx < min_day:
+                    routing.VehicleVar(ni).RemoveValue(v)
+            n_copy1_blocked += 1
+        if n_copy1_blocked:
+            print(f"  Multi-visit constraint: {n_copy1_blocked} second-visit "
+                  f"copy(ies) blocked from too-early days")
 
     # ── Total-capacity dimension (truck physical cap = 10,000 lbs) ───────
     def _demand_cb(from_idx):
@@ -989,7 +1140,11 @@ def solve_week(
             horizon_end_days = (plan_dates[-1] - today).days + 1
         dte_at_horizon_end = (cur_lbs / rate_lbs - horizon_end_days) if rate_lbs > 0 else 999
 
-        # ── Penalty tiers ───────────────────────────────────────────────
+        # ── Penalty tiers (rolling-horizon graduated) ───────────────────
+        # Penalty decays as DTE grows so that far-future clients are
+        # genuinely cheap to defer. Without this taper, including all
+        # routable clients (the rolling-horizon fix) would over-pack
+        # routes with nice-to-have visits.
         if day0_dte <= 0:
             # STOCKOUT: will be empty by tomorrow. Prohibitive penalty.
             base_penalty = 1_000_000_000   # 1 billion — never drop
@@ -1005,10 +1160,20 @@ def solve_week(
             n_urgent_day += 1
         elif dte_at_horizon_end <= HORIZON_BUFFER_DAYS and not far:
             base_penalty = 3_000_000       # Horizon-cliff escalation
-        elif far:
-            base_penalty = 150_000         # Normal far
+        elif worst_dte <= _npd + 2:
+            # Within horizon: real candidates for the plan
+            base_penalty = 150_000 if far else 1_500_000
+        elif worst_dte <= _npd + 7:
+            # 1 cycle out: opportunistic only — truck is probably nearby
+            # for some other client; pick this one up if cheap.
+            base_penalty = 50_000 if far else 400_000
+        elif worst_dte <= _npd + 14:
+            # 2 cycles out: very cheap to defer; only if truck is RIGHT next door
+            base_penalty = 15_000 if far else 100_000
         else:
-            base_penalty = 1_500_000       # Normal metro
+            # Deep future: nearly free to drop. Solver will only pick them up
+            # if a passing route incurs ~zero marginal cost (same neighborhood).
+            base_penalty = 5_000 if far else 20_000
 
         # Operator must-visit override: force 1B penalty
         cid_str = str(pool.iloc[i]['ID'])
@@ -1019,6 +1184,15 @@ def solve_week(
         # Fill-efficiency amplifier (Cornillier PSRPTW)
         _eff_w = float(getattr(_cfg, 'EFFICIENCY_WEIGHT', EFFICIENCY_WEIGHT))
         penalty = int(round(base_penalty * (1.0 + _eff_w * best_fill_pct)))
+
+        # Multi-visit copy: skipping the SECOND visit is much cheaper.
+        # The first visit's penalty handles the must-serve guarantee;
+        # the second is opportunistic — drop it freely if the routing
+        # geometry doesn't make it cost-effective.
+        visit_copy = int(pool.iloc[i].get('_visit_copy', 0))
+        if visit_copy >= 1:
+            penalty = max(int(penalty * 0.05), 5_000)
+            client_is_mandatory[i] = False   # never force a second visit
 
         routing.AddDisjunction([ni], penalty)
 
@@ -1144,6 +1318,78 @@ def solve_week(
                 dl = 0
             client_deadline.append(dl)
 
+        # ── Neighbor-sweep: cross-day cluster cohesion ───────────────────
+        # Problem: per-client preferred days drift apart when consumption
+        # rates differ inside one micro-area, sending trucks back to the
+        # same neighborhood on different days (e.g., Lake Pleasant Pkwy:
+        # DILLONS BAYOU on Sat, TAILGATERS / SARDELLA'S on Wed).
+        #
+        # Fix: for each client, look at neighbors within radius. If a
+        # neighbor has an earlier preferred day AND visiting this client
+        # on that earlier day is feasible (won't stock out + fill ≥ min),
+        # pull the preferred day earlier. One-directional (earlier only)
+        # so we never push a client toward stockout. Mandatory clients
+        # are skipped (their preferred day is already Day 0).
+        _sweep_enabled    = bool(getattr(_cfg, 'NEIGHBOR_SWEEP_ENABLED', True))
+        _sweep_radius_mi  = float(getattr(_cfg, 'NEIGHBOR_SWEEP_RADIUS_MI', 12.0))
+        _sweep_min_fill   = float(getattr(_cfg, 'NEIGHBOR_SWEEP_MIN_FILL', 0.20))
+        if _sweep_enabled and n_clients > 1:
+            base_deadline = list(client_deadline)  # snapshot before sweep
+            n_pulled = 0
+            sweep_examples = []
+            # Pre-extract lat/lon/tank/d2so to avoid repeated DataFrame lookups
+            lats  = [float(pool.iloc[i]['Lat']) for i in range(n_clients)]
+            lons  = [float(pool.iloc[i]['Lon']) for i in range(n_clients)]
+            tanks = [max(float(pool.iloc[i]['Tank_lbs']), 1.0) for i in range(n_clients)]
+            d2sos = [float(pool.iloc[i].get('Days_Until_Stockout') or 999)
+                     for i in range(n_clients)]
+            for i in range(n_clients):
+                if client_is_mandatory[i]:
+                    continue  # already pinned to Day 0
+                target_day = client_deadline[i]
+                target_via = None
+                for j in range(n_clients):
+                    if i == j:
+                        continue
+                    if base_deadline[j] >= target_day:
+                        continue  # j is not earlier — nothing to pull toward
+                    # Distance gate
+                    dist = _haversine_mi(lats[i], lons[i], lats[j], lons[j])
+                    if dist > _sweep_radius_mi:
+                        continue
+                    j_day = base_deadline[j]
+                    # Feasibility: i must not stock out before j's day.
+                    # d2sos[i] is days-from-today; j_day is also days-from-today
+                    # (Day 0 = today's commit day in the horizon).
+                    if d2sos[i] < j_day:
+                        continue
+                    # Fill economics on j's day — don't waste a stop on a
+                    # nearly-full tank.
+                    if j_day < len(refills_by_day) and (i + 1) < len(refills_by_day[j_day]):
+                        refill_on_j = refills_by_day[j_day][i + 1]
+                        fill_on_j = refill_on_j / tanks[i] if tanks[i] > 0 else 0.0
+                        if fill_on_j < _sweep_min_fill:
+                            continue
+                    target_day = j_day
+                    target_via = j
+                if target_day < client_deadline[i]:
+                    if len(sweep_examples) < 3:
+                        sweep_examples.append((
+                            str(pool.iloc[i].get('Customer', pool.iloc[i].get('ID', '?')))[:30],
+                            client_deadline[i], target_day,
+                            str(pool.iloc[target_via].get('Customer',
+                                pool.iloc[target_via].get('ID', '?')))[:30],
+                        ))
+                    client_deadline[i] = target_day
+                    n_pulled += 1
+
+            if n_pulled:
+                print(f"  Neighbor-sweep: pulled {n_pulled} client(s) to earlier "
+                      f"days (radius={_sweep_radius_mi:.1f} mi, "
+                      f"min_fill={_sweep_min_fill:.0%})")
+                for name, was, now, anchor in sweep_examples:
+                    print(f"    {name:<30} day {was}→{now}  (via {anchor})")
+
         # Per-vehicle cost callback that adds lateness penalty
         for v in range(n_vehicles):
             _, day_idx, _ = _v2tdc(v)
@@ -1232,8 +1478,46 @@ def solve_week(
         params.solution_limit = _sol_limit
     params.log_search = False
 
+    # ── Optional warm-start from a prior solution ────────────────────────
+    initial_assignment = None
+    if initial_routes_by_vehicle:
+        try:
+            # Build {client_id (str): pool node index} for translation.
+            id_to_node = {
+                str(cid): i + 1   # +1 because depot is node 0
+                for i, cid in enumerate(pool['ID'].astype(str).tolist())
+            }
+            ot_routes: List[List[int]] = [[] for _ in range(n_vehicles)]
+            ws_matched, ws_missed = 0, 0
+            for v_idx, ids in initial_routes_by_vehicle.items():
+                if v_idx < 0 or v_idx >= n_vehicles:
+                    continue
+                for cid in ids:
+                    n = id_to_node.get(str(cid))
+                    if n is None:
+                        ws_missed += 1
+                        continue
+                    ot_routes[v_idx].append(n)
+                    ws_matched += 1
+            if ws_matched > 0:
+                initial_assignment = routing.ReadAssignmentFromRoutes(
+                    ot_routes, True   # ignore_inactive_indices
+                )
+                print(f"  ↻ Warm start: {ws_matched} visits matched "
+                      f"({ws_missed} missed), seeding solver search.")
+            else:
+                print('  ↻ Warm start: no usable visits — cold start.')
+        except Exception as e:
+            print(f'  ↻ Warm start skipped: {e}')
+            initial_assignment = None
+
     print(f"\n  Solving... (time limit: {solve_seconds}s)")
-    solution = routing.SolveWithParameters(params)
+    if initial_assignment is not None:
+        solution = routing.SolveFromAssignmentWithParameters(
+            initial_assignment, params,
+        )
+    else:
+        solution = routing.SolveWithParameters(params)
 
     if solution is None:
         print(f"  ✗ No feasible solution. Status: {routing.status()}")
@@ -1253,6 +1537,7 @@ def solve_week(
         urgency_by_day=urgency_by_day,
         n_plan_days=_npd,
         truck_names=_active_truck_names,
+        shift_start_min=int(depot_config.get('shift_start_min', 6 * 60)),
     )
 
     # ── Deferred ─────────────────────────────────────────────────────────
@@ -1327,22 +1612,37 @@ def _build_pool(
     # Fill efficiency (current)
     df['Fill_Pct'] = df['Refill_lbs'] / df['Tank_lbs']
 
-    # Eligibility: include anyone who will need service within the week.
-    # Either they already need ≥50% fill today, OR they'll hit stockout
-    # within 7 days (matching the notebook's VISIT_WINDOW approach), OR
-    # their contractual cadence would be violated by end of week (Aksen 2012).
-    # The third clause closes the pool-filter gap: without it, a client with
-    # Days_Since_Last=13 and a near-full tank gets dropped before the solver
-    # can honor the contract.
-    # Eligibility: need service within the planning horizon.
-    # DTE threshold = horizon length + 2 buffer days (accounts for weekend gaps).
-    # With a 10-day horizon this means DTE ≤ 14 — any client who'll stockout
-    # within the plan window gets included so the solver can schedule them optimally.
-    dte_threshold = n_plan_days + 2  # +2 for weekend gap buffer
-    eligible = (
-        (df['Fill_Pct'] >= OPPORTUNISTIC_FILL_PCT)
-        | (df['Days_Until_Stockout'] <= dte_threshold)
-    )
+    # ── Eligibility (rolling-horizon correct) ─────────────────────────────
+    # PRINCIPLE: a true rolling-horizon IRP must SEE every routable client,
+    # not just today's emergencies. Otherwise a client whose stockout falls
+    # 2 days BEYOND the horizon (e.g. day 12 with a 10-day plan) gets
+    # silently dropped today, dropped tomorrow, dropped the day after —
+    # until DTE finally crosses the threshold and they're "discovered" as
+    # urgent. By then the solver has lost every opportunity to fold them
+    # into a passing route.
+    #
+    # The fix: include EVERY routable client. Far-future clients get a
+    # large drop penalty (cheap to defer), so the solver only schedules
+    # them if the geography is cheap or capacity is available. Near-future
+    # clients get small drop penalties (expensive to defer). The solver
+    # decides — that's the whole point of an OR-Tools CVRP with disjunctions.
+    #
+    # Cost: pool grows from ~60 to ~171 (~3×). Solve time grows roughly
+    # linearly per pool size for OR-Tools' local search; with the existing
+    # 30-vehicle structure the increase is manageable for 10-min solves.
+    # Default: every routable client is eligible. The solver decides via
+    # disjunction penalties (small for non-urgent, large for urgent) which
+    # ones get scheduled. To restore the legacy "only urgent" filter for
+    # debugging or speed, set ENABLE_FORWARD_EMPTY_CLIENTS = False in config.
+    enable_forward = getattr(_cfg, 'ENABLE_FORWARD_EMPTY_CLIENTS', True)
+    if enable_forward:
+        eligible = pd.Series(True, index=df.index)
+    else:
+        dte_threshold = n_plan_days + 2
+        eligible = (
+            (df['Fill_Pct'] >= OPPORTUNISTIC_FILL_PCT)
+            | (df['Days_Until_Stockout'] <= dte_threshold)
+        )
 
     # ── Far-cluster sweep: if ANY client in a distant city qualifies,
     # pull in ALL siblings from that cluster. The truck is already making
@@ -1437,6 +1737,7 @@ def _extract_routes(
     urgency_by_day:  Optional[List[List[str]]]    = None,
     n_plan_days:     int = NUM_DAYS,
     truck_names:     Optional[List[str]] = None,
+    shift_start_min: int = 360,
 ) -> Dict[int, pd.DataFrame]:
     """Convert OR-Tools solution → per-day route DataFrames.
     Uses day-projected refills, urgency, and days-to-empty when available."""
@@ -1483,6 +1784,12 @@ def _extract_routes(
 
                 svc_min = setup + math.ceil(refill / rate)
 
+                # Driver leaves the warehouse at shift_start_min (default
+                # 6:00 AM = 360 min). Arrival time at this stop = shift
+                # start + cumulative time so far + travel to this stop.
+                arrival_min = shift_start_min + cum_time + travel_min
+                depart_min  = arrival_min + svc_min
+
                 cum_dist  += travel_m
                 cum_time  += travel_min + svc_min
 
@@ -1523,6 +1830,10 @@ def _extract_routes(
                     'VisitScore':          0,
                     'Service_Min':         svc_min,
                     'Travel_To_Min':       travel_min,
+                    'Arrival_Min':         arrival_min,
+                    'Depart_Min':          depart_min,
+                    'Arrival_HHMM':        f'{arrival_min // 60:02d}:{arrival_min % 60:02d}',
+                    'Depart_HHMM':         f'{depart_min // 60:02d}:{depart_min % 60:02d}',
                     'Dist_To_m':           travel_m,
                     'Dist_To_mi':          round(travel_m / METERS_PER_MILE, 2),
                     'Cum_Dist_mi':         round(cum_dist / METERS_PER_MILE, 2),

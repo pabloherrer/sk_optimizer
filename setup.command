@@ -13,12 +13,36 @@ echo "================================================"
 echo ""
 
 # ── Check Python ─────────────────────────────────
-# Try python3 first (standard on Mac), then python
+# Search for Python 3.10+ in order of preference:
+#   1. Homebrew versioned installs (python3.13 → python3.10)
+#   2. Homebrew generic python3
+#   3. System python3 / python
 PYTHON_CMD=""
-if command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
-elif command -v python &>/dev/null; then
-    PYTHON_CMD="python"
+for try_cmd in python3.13 python3.12 python3.11 python3.10; do
+    if command -v "$try_cmd" &>/dev/null; then
+        PYTHON_CMD="$try_cmd"
+        break
+    fi
+done
+# Also check Homebrew paths directly (not always on PATH)
+if [ -z "$PYTHON_CMD" ]; then
+    for brew_py in /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
+                   /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
+                   /usr/local/bin/python3.13 /usr/local/bin/python3.12 \
+                   /usr/local/bin/python3.11 /usr/local/bin/python3.10; do
+        if [ -x "$brew_py" ]; then
+            PYTHON_CMD="$brew_py"
+            break
+        fi
+    done
+fi
+# Fallback to generic python3 / python
+if [ -z "$PYTHON_CMD" ]; then
+    if command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    elif command -v python &>/dev/null; then
+        PYTHON_CMD="python"
+    fi
 fi
 
 if [ -z "$PYTHON_CMD" ]; then

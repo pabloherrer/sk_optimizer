@@ -38,7 +38,8 @@ GEOM_CACHE_FILE = DATA_DIR / 'route_geom_cache.json'
 # ── Excel ─────────────────────────────────────────────────────────────────────
 
 ROUTE_COLS = [
-    'Stop', 'Date', 'Travel_To_Min', 'Dist_To_mi', 'Customer', 'Zone',
+    'Stop', 'Date', 'Arrival_HHMM', 'Depart_HHMM',
+    'Travel_To_Min', 'Dist_To_mi', 'Customer', 'Zone',
     'Days_Until_Stockout', 'DaysToStockoutAtVisit', 'Urgency',
     'Tank_lbs', 'Current_lbs', 'Refill_lbs', 'Fill_Pct',
     'Avg_LbsPerDay', 'Service_Min', 'Product',
@@ -49,6 +50,8 @@ ROUTE_COLS = [
 ROUTE_COL_LABELS = {
     'Stop':                  '#',
     'Date':                  'Date',
+    'Arrival_HHMM':          'Arrive',
+    'Depart_HHMM':           'Depart',
     'Travel_To_Min':         'Drive (min)',
     'Dist_To_mi':            'Dist (mi)',
     'Customer':              'Customer',
@@ -324,32 +327,25 @@ def _add_printable_sheets(
     wb = load_workbook(str(filepath))
     bd = Border(*[Side(style='thin', color='FFBBBBBB')] * 4)
 
-    # Column widths: max of route-table needs and manifest text needs
-    col_width_by_name = {
-        'Stop':                  6,
-        'Date':                  12,
-        'Travel_To_Min':         10,
-        'Dist_To_mi':            9,
-        'Customer':              34,
-        'Zone':                  6,
-        'Days_Until_Stockout':   11,
-        'DaysToStockoutAtVisit': 11,
-        'Urgency':               10,
-        'Tank_lbs':              10,
-        'Current_lbs':           10,
-        'Refill_lbs':            11,
-        'Fill_Pct':              8,
-        'Avg_LbsPerDay':         11,
-        'Service_Min':           9,
-        'Product':               16,
-        'Route_Dist_mi':         12,
-        'Route_Time_min':        10,
-        'Shift_Pct':             8,
-        'Cap_Pct':               8,
+    # ── Print-friendly column selection (essential info only) ───────────
+    PRINT_COLS = [
+        'Stop', 'Arrival_HHMM', 'Customer', 'Zone', 'Product',
+        'Refill_lbs', 'Days_Until_Stockout', 'Urgency', 'Tank_lbs',
+    ]
+    PRINT_COL_WIDTHS = {
+        'Stop':                6,
+        'Arrival_HHMM':        9,
+        'Customer':           38,
+        'Zone':                8,
+        'Product':            18,
+        'Refill_lbs':         14,
+        'Days_Until_Stockout': 14,
+        'Urgency':            12,
+        'Tank_lbs':           13,
     }
     # Manifest occupies cols 1-5; enforce minimum widths so product names show.
     # Col 8 = "Status" in the caution table ("Confirmed — 2026-04-21" is ~26 chars).
-    MANIFEST_MIN = {1: 10, 2: 22, 3: 24, 4: 14, 5: 8, 8: 26}
+    MANIFEST_MIN = {1: 12, 2: 24, 3: 26, 4: 16, 5: 10, 8: 28}
 
     urgency_fills = {
         'stockout': PatternFill('solid', fgColor=URGENCY_FILL_COLORS['stockout']),
@@ -383,12 +379,12 @@ def _add_printable_sheets(
 
         cur = 1  # current writing row (1-based)
 
-        # Determine route columns from first non-empty truck df
+        # Determine route columns from first non-empty truck df (print subset)
         route_cols_present: List[str] = []
         for truck in TRUCK_NAMES:
             sub0 = routes[routes['Truck'] == truck]
             if not sub0.empty:
-                route_cols_present = [c for c in ROUTE_COLS if c in sub0.columns]
+                route_cols_present = [c for c in PRINT_COLS if c in sub0.columns]
                 break
         n_cols = max(len(route_cols_present), 5)
 
@@ -409,10 +405,10 @@ def _add_printable_sheets(
             hdr = ws.cell(cur, 1,
                 value=f"{truck}  |  {day_short}  |  {len(sub)} stops  |  "
                       f"{load:,} lbs ({cap_p}%)  |  {dist:.1f} mi  |  {hrs}h {m:02d}m")
-            hdr.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=12)
+            hdr.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=16)
             hdr.fill      = PatternFill('solid', fgColor=TRUCK_HEX.get(truck, 'FF333333'))
             hdr.alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[cur].height = 22
+            ws.row_dimensions[cur].height = 30
             cur += 1
 
             # ── Manifest header row ──────────────────────────────────────────
@@ -421,9 +417,9 @@ def _add_printable_sheets(
             for ci, label in enumerate(manifest_hdr_labels, 1):
                 c = ws.cell(cur, ci, value=label)
                 c.fill      = mhdr_fill
-                c.font      = Font(name='Arial', bold=True, color='FF2C3E50', size=10)
+                c.font      = Font(name='Arial', bold=True, color='FF2C3E50', size=12)
                 c.alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[cur].height = 18
+            ws.row_dimensions[cur].height = 22
             cur += 1
 
             # ── Manifest data row ────────────────────────────────────────────
@@ -443,27 +439,27 @@ def _add_printable_sheets(
             for ci, val in enumerate(manifest_vals, 1):
                 c = ws.cell(cur, ci, value=val)
                 c.fill      = mdata_fill
-                c.font      = Font(name='Arial', size=10, bold=True)
+                c.font      = Font(name='Arial', size=12, bold=True)
                 c.alignment = Alignment(
                     horizontal='center' if ci == 5 else 'left',
                     vertical='center',
                 )
-            ws.row_dimensions[cur].height = 20
+            ws.row_dimensions[cur].height = 24
             cur += 1
 
             # ── Blank separator ──────────────────────────────────────────────
             cur += 1
 
-            # ── Route-table column headers ───────────────────────────────────
-            rcols = [c for c in ROUTE_COLS if c in sub.columns]
+            # ── Route-table column headers (print-friendly subset) ────────────
+            rcols = [c for c in PRINT_COLS if c in sub.columns]
             for ci, col_name in enumerate(rcols, 1):
                 c = ws.cell(cur, ci)
                 c.value     = ROUTE_COL_LABELS.get(col_name, col_name)
                 c.fill      = PatternFill('solid', fgColor='FF2C3E50')
-                c.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=9)
+                c.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=12)
                 c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                 c.border    = bd
-            ws.row_dimensions[cur].height = 28
+            ws.row_dimensions[cur].height = 30
             cur += 1
 
             # ── Data rows ────────────────────────────────────────────────────
@@ -475,14 +471,14 @@ def _add_printable_sheets(
                     c.value     = row.get(col_name)
                     c.fill      = fill
                     c.border    = bd
-                    c.font      = Font(name='Arial', size=9)
+                    c.font      = Font(name='Arial', size=13)
                     c.alignment = Alignment(
                         horizontal='left' if col_name in left_align_cols else 'center',
                         vertical='center',
                     )
                     if col_name in ROUTE_COL_FORMATS:
                         c.number_format = ROUTE_COL_FORMATS[col_name]
-                ws.row_dimensions[cur].height = 16
+                ws.row_dimensions[cur].height = 24
                 cur += 1
 
             # Gap between trucks
@@ -550,18 +546,18 @@ def _add_printable_sheets(
                 c = ws.cell(cur, 1,
                     value=f'⚠  CAUTION — Stocking out by {day_short} {date_str}, '
                           f'delivered AFTER this day')
-                c.font      = Font(name='Arial', bold=True, size=13, color='FF993300')
+                c.font      = Font(name='Arial', bold=True, size=15, color='FF993300')
                 c.alignment = Alignment(horizontal='left', vertical='center')
-                ws.row_dimensions[cur].height = 26
+                ws.row_dimensions[cur].height = 30
                 cur += 1
 
                 ws.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=n_cols)
                 c = ws.cell(cur, 1,
                     value='These clients run out on or before this day but will not receive '
                           'a delivery until later — or are not scheduled at all.')
-                c.font      = Font(name='Arial', size=10, color='FF993300', italic=True)
+                c.font      = Font(name='Arial', size=11, color='FF993300', italic=True)
                 c.alignment = Alignment(horizontal='left', vertical='center')
-                ws.row_dimensions[cur].height = 18
+                ws.row_dimensions[cur].height = 22
                 cur += 2
 
                 # Table header
@@ -571,10 +567,10 @@ def _add_printable_sheets(
                 for ci, h in enumerate(caut_cols, 1):
                     c = ws.cell(cur, ci, value=h)
                     c.fill      = caut_hdr_fill
-                    c.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=9)
+                    c.font      = Font(name='Arial', bold=True, color='FFFFFFFF', size=12)
                     c.alignment = Alignment(horizontal='center', vertical='center')
                     c.border    = bd
-                ws.row_dimensions[cur].height = 20
+                ws.row_dimensions[cur].height = 26
                 cur += 1
 
                 for _, row in at_risk.iterrows():
@@ -606,19 +602,20 @@ def _add_printable_sheets(
                     for ci, val in enumerate(vals, 1):
                         c = ws.cell(cur, ci, value=val)
                         c.fill      = row_fill
-                        c.font      = Font(name='Arial', size=9,
+                        c.font      = Font(name='Arial', size=11,
                                           bold=(ci == 8))
                         c.border    = bd
                         c.alignment = Alignment(
                             horizontal='left' if ci in (2, 8) else 'center',
                             vertical='center',
                         )
-                    ws.row_dimensions[cur].height = 16
+                    ws.row_dimensions[cur].height = 22
                     cur += 1
 
         # ── Column widths ────────────────────────────────────────────────────
-        for ci, col_name in enumerate(route_cols_present, 1):
-            w = col_width_by_name.get(col_name, 10)
+        print_cols_present = [c for c in PRINT_COLS if c in route_cols_present]
+        for ci, col_name in enumerate(print_cols_present, 1):
+            w = PRINT_COL_WIDTHS.get(col_name, 12)
             w = max(w, MANIFEST_MIN.get(ci, 0))
             ws.column_dimensions[get_column_letter(ci)].width = w
 
@@ -630,7 +627,7 @@ def _add_printable_sheets(
         ws.page_setup.fitToHeight          = 0       # auto height pages
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_margins = PageMargins(
-            left=0.4, right=0.4, top=0.6, bottom=0.6,
+            left=0.5, right=0.5, top=0.5, bottom=0.5,
             header=0.2, footer=0.2,
         )
         # Print area covers all written rows

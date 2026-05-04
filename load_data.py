@@ -84,6 +84,11 @@ def load_clients(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
             'Service_Min': _to_float(row[11]) if len(row) > 11 else None,
             'Access_Notes': str(row[12]).strip() if len(row) > 12 and row[12] else None,
             'Phone': str(row[13]).strip() if len(row) > 13 and row[13] else None,
+            # Columns added by ingest_scheduler_notes.py — present if the
+            # ingest has been run; otherwise None / empty
+            'ANOVA':            str(row[14]).strip() if len(row) > 14 and row[14] else '',
+            'Notes':            str(row[15]).strip() if len(row) > 15 and row[15] else '',
+            'Do_Not_Schedule':  str(row[16]).strip() if len(row) > 16 and row[16] else '',
         })
 
     df = pd.DataFrame(records)
@@ -121,23 +126,45 @@ def load_deliveries(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
     """
     Parse Delivery_Log sheet.
 
-    Expected layout (data starts at row 4):
-      Col A : Date delivered    (datetime)
-      Col B : Customer          (must match Client_List exactly)
-      Col F : Tank (lbs)        (snapshot of tank size at delivery — informational)
-      Col G : Qty Delivered (lbs)
-      Col J : Invoice #         (optional — kept for reference)
+    Current layout (data starts at row 4):
+      Col A (0) : Date delivered    (datetime)
+      Col B (1) : Customer ID       (numeric — matches Client_List col A)
+      Col C (2) : Customer Name     (formula — may be None in data_only mode)
+      Col D (3) : Qty Delivered (lbs)  ← INPUT column
+      Col E (4) : Zone              (formula)
+      Col F (5) : Zone_Code         (formula)
+      Col G (6) : Product           (formula)
+      Col H (7) : Tank (lbs)        (formula)
+      Col I (8) : Days Since        (formula)
+      Col J (9) : Lbs/Day           (formula)
+      Col K (10): Running Avg       (formula)
 
     Rows with missing Date or zero/non-numeric Qty are dropped.
+    Customer ID (col B) is resolved to full name via Client_List lookup.
     """
     wb = load_workbook(str(input_file), data_only=True)
+
+    # Build ID → Customer name lookup from Client_List
+    cl = wb['Client_List']
+    id_to_name = {}
+    for r in cl.iter_rows(min_row=4, values_only=True):
+        if not r[0] or not r[1]:
+            continue
+        try:
+            cid = str(int(float(r[0])))
+        except (ValueError, TypeError):
+            import re as _re
+            m = _re.match(r'(\d+)', str(r[0]))
+            cid = m.group(1) if m else str(r[0]).strip()
+        id_to_name[cid] = str(r[1]).strip()
+
     ws = wb['Delivery_Log']
 
     records = []
     for row in ws.iter_rows(min_row=4, values_only=True):
         if not row[0]:
             continue
-        qty = row[6]
+        qty = row[3]   # Col D — Qty Delivered
         if not isinstance(qty, (int, float)) or qty <= 0:
             continue
 
@@ -148,12 +175,25 @@ def load_deliveries(input_file: str | Path = INPUT_FILE) -> pd.DataFrame:
         except Exception:
             continue
 
+        # Resolve customer name from numeric ID in col B
+        raw_id = row[1]
+        if raw_id is None:
+            continue
+        try:
+            cid_str = str(int(float(raw_id)))
+        except (ValueError, TypeError):
+            cid_str = str(raw_id).strip()
+        customer = id_to_name.get(cid_str, cid_str)   # fall back to raw ID string
+
         records.append({
             'Date':     d,
-            'Customer': str(row[1]).strip() if row[1] else '',
-            'Tank_lbs': _to_float(row[5]),
+            'Customer': customer,
+            'Tank_lbs': _to_float(row[7]),   # Col H — Tank
             'Qty_lbs':  float(qty),
-            'Invoice':  str(row[9]).strip() if row[9] else '',
+            # 200-lb is the human-entered "I delivered something today but
+            # I don't know the amount yet" placeholder. The forecaster must
+            # exclude it from rate computation or rates collapse to zero.
+            'Is_Placeholder': float(qty) == 200.0,
         })
 
     df = pd.DataFrame(records)

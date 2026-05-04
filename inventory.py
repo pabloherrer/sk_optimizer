@@ -43,9 +43,47 @@ def project_level(
     tank_lbs:     float,
     min_pct:      float = MIN_OIL_PCT,
 ) -> float:
-    """Tank level `days_forward` days from now, clamped to [floor, tank]."""
+    """Tank level `days_forward` days from now, clamped to [floor, tank].
+    Uses constant cross-DOW mean rate. For DOW-aware projection use
+    `project_level_dow()` instead."""
     floor = tank_lbs * min_pct
     return float(np.clip(current_lbs - days_forward * rate_lbs_day, floor, tank_lbs))
+
+
+def project_level_dow(
+    current_lbs:  float,
+    rate_by_dow:  list,
+    today,
+    days_forward: int,
+    tank_lbs:     float,
+    min_pct:      float = MIN_OIL_PCT,
+) -> float:
+    """
+    DOW-aware projection: sum the per-DOW rate from today+1 through
+    today+days_forward, accounting for varying daily demand.
+
+    Parameters
+    ----------
+    rate_by_dow : list of 7 floats, indexed by Timestamp.weekday()
+                  (0=Mon, 1=Tue, ..., 6=Sun)
+    today       : pd.Timestamp — anchor date (consumption starts the
+                  next day)
+    days_forward: int — how many calendar days into the future
+
+    Returns clamped projected level.
+    """
+    import pandas as pd
+    if not rate_by_dow or len(rate_by_dow) != 7:
+        # Fallback: treat as constant if DOW rates unavailable
+        avg = (sum(rate_by_dow) / 7.0) if rate_by_dow else 0.0
+        return project_level(current_lbs, avg, days_forward, tank_lbs, min_pct)
+    floor = tank_lbs * min_pct
+    today = pd.Timestamp(today).normalize()
+    cum = 0.0
+    for k in range(1, int(days_forward) + 1):
+        d = today + pd.Timedelta(days=k)
+        cum += float(rate_by_dow[d.weekday()])
+    return float(np.clip(current_lbs - cum, floor, tank_lbs))
 
 
 def compute_refill(

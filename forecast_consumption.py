@@ -58,9 +58,11 @@ def estimate_consumption_rates(
     dl['Prev_Date'] = dl.groupby('Customer')['Date'].shift(1)
     dl['Days_Gap']  = (dl['Date'] - dl['Prev_Date']).dt.days
 
-    # Rate is only defined for deliveries with a known prior delivery
+    # Exclude placeholder rows (Qty=200 = "I delivered something but don't
+    # know the amount yet") from rate computation. They poison the rate.
+    is_placeholder = dl.get('Is_Placeholder', dl['Qty_lbs'] == 200.0)
     dl['Rate'] = np.where(
-        (dl['Days_Gap'] > 0) & dl['Days_Gap'].notna(),
+        (dl['Days_Gap'] > 0) & dl['Days_Gap'].notna() & ~is_placeholder,
         dl['Qty_lbs'] / dl['Days_Gap'],
         np.nan,
     )
@@ -152,16 +154,23 @@ def estimate_consumption_rates(
     # which means we conservatively assume they are somewhat depleted.
     result['Days_Since_Used'] = result['Days_Since_Last'].fillna(FALLBACK_DAYS_SINCE)
 
-    # For INSUFFICIENT_DATA clients we cannot estimate current level — use the
-    # conservative assumption that tank is ~half full (they were delivered
-    # recently enough to still be on our books) so downstream code still runs.
-    # These clients will be excluded from the optimizer via the Rate_Source flag.
+    # Estimate current tank level. Two adjustments vs the naive
+    # "tank − days_since × rate":
+    #   1. Floor at 25% of tank rather than 3%. If our log says a
+    #      client hasn't been delivered in 30+ days, the more likely
+    #      explanation is "they're handled outside the metro route"
+    #      than "they've been running on fumes for a month." Defaulting
+    #      to 3% empties imaginary tanks and floods day-0 with fake
+    #      urgency.
+    #   2. Cap at 90% of tank for clients with very recent deliveries —
+    #      the actual visit may have happened any time on the delivery
+    #      day, so right after a visit shows ~95-100%, gradually decaying.
     rate_for_calc = result['Avg_LbsPerDay'].fillna(0)
     result['Est_Current_lbs'] = (
         result['Tank_lbs']
         - result['Days_Since_Used'] * rate_for_calc
-    ).clip(lower=result['Tank_lbs'] * 0.03,
-           upper=result['Tank_lbs'])         # Can't exceed tank capacity
+    ).clip(lower=result['Tank_lbs'] * 0.25,    # was 0.03 — too pessimistic
+           upper=result['Tank_lbs'])
     # Override: insufficient-data clients default to 50% tank
     mask_insuf = result['Rate_Source'] == 'INSUFFICIENT_DATA'
     result.loc[mask_insuf, 'Est_Current_lbs'] = (result.loc[mask_insuf, 'Tank_lbs'] * 0.5).round()
