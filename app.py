@@ -514,6 +514,7 @@ def settings_route():
                         'note': 'Restart the app for the new path to take effect.'})
 
 
+<<<<<<< HEAD
 @app.route('/planning')
 def planning_view():
     """Standalone planning dashboard powered by /api/plan-summary,
@@ -726,6 +727,8 @@ def fill_audit_route():
         return jsonify({'error': str(e)}), 500
 
 
+=======
+>>>>>>> 3d12137e5e0cf6567f21b2c16883ac4a94f7c59e
 @app.route('/snapshot')
 def snapshot_route():
     """Return pre-solve client estimates: who needs oil, urgency, DTE, refill lbs."""
@@ -1524,6 +1527,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .modal-msg.ok { display: block; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
   .modal-msg.err { display: block; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+<<<<<<< HEAD
 
   /* ── Log Delivery Panel ── */
   .log-form { display: flex; flex-direction: column; gap: 12px; }
@@ -1569,6 +1573,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   .log-result.ok  { display: block; background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
   .log-result.err { display: block; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }
+=======
+>>>>>>> 3d12137e5e0cf6567f21b2c16883ac4a94f7c59e
 </style>
 </head>
 <body>
@@ -2372,6 +2378,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 </script>
 
+<<<<<<< HEAD
 <!-- ── Log Delivery JS ── -->
 <script>
 (function () {
@@ -2526,6 +2533,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 })();
 </script>
 
+=======
+>>>>>>> 3d12137e5e0cf6567f21b2c16883ac4a94f7c59e
 <!-- ── Settings Modal ── -->
 <div class="modal-overlay" id="settingsModal">
   <div class="modal-box">
@@ -2592,6 +2601,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
 </script>
 
+<<<<<<< HEAD
 </body>
 </html>"""
 
@@ -3010,6 +3020,8 @@ function loadFill() {
 loadPending(); loadPlan(); loadAnova(); loadFill();
 setInterval(loadAnova, 60000);
 </script>
+=======
+>>>>>>> 3d12137e5e0cf6567f21b2c16883ac4a94f7c59e
 </body>
 </html>"""
 
