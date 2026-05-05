@@ -193,10 +193,13 @@ OPPORTUNISTIC_FILL_PCT = 0.55  # Opportunistic backfill: if truck is already nea
 # Default radius 12 mi is intentionally generous — covers the case where a
 # parkway-cluster spans ~10 mi (e.g., DILLONS BAYOU at 87th Ave to TAILGATERS
 # LAKE PLEASANT at 101st Ave). Tighten to 6–8 mi for more conservative behavior.
-NEIGHBOR_SWEEP_ENABLED   = True
+NEIGHBOR_SWEEP_ENABLED   = False  # OR call: heuristic was duplicating work the objective
+                                  # already does. With fixed_setup_min=18 in the time dim,
+                                  # the solver sees the cost of partial fills. Trust the math.
 NEIGHBOR_SWEEP_RADIUS_MI = 12.0   # Max haversine miles between neighbors
-NEIGHBOR_SWEEP_MIN_FILL  = 0.20   # Don't pull a client whose tank would be <20% empty
-                                  # on the target day — refill not worth the pump time
+NEIGHBOR_SWEEP_MIN_FILL  = 0.50   # Don't pull a client unless tank is ≥50% empty —
+                                  # below that, the per-stop fixed cost (setup + paperwork)
+                                  # outweighs the refill value. A stop must be worth it.
 
 # ── Scoring / objective weights ───────────────────────────────────────────────
 # Phase-1 visit score:
