@@ -1,202 +1,175 @@
-# S&K Oil Sales — Route Optimizer
+# S&K Route Optimizer
 
-A weekly route optimizer for S&K Oil Sales. Reads a single Excel workbook, produces a 5-day truck schedule (Tue–Sat) with maps, and flags problems in plain English before anything runs.
+A production solver for the **Inventory Routing Problem (IRP)** at S&K Oil Sales. Combines OR-Tools CVRP, live tank sensors (Anova Transcend), chance-constrained urgency forecasting, and a rolling-horizon plan that re-solves daily.
+
+---
+
+## The problem
+
+S&K delivers cooking oil to ~170 restaurants across the Phoenix metro. Two trucks (Truck2 and Truck9), 5 working days a week (Tue–Sat). Every restaurant has a tank that drains at its own rate; some have live sensors, some don't.
+
+**Three decisions, one optimization, every afternoon:**
+
+1. **Inventory** — which tanks need oil within the planning horizon?
+2. **Routing** — what's the cheapest way to visit them?
+3. **Scheduling** — which day does each delivery happen?
+
+These are coupled: deliver too early and you waste pump time on partial fills; deliver too late and the restaurant runs dry. The classical IRP formulation (Coelho-Cordeau-Laporte 2014) is what this solver implements.
+
+---
+
+## Architecture
+
+```
+                              ┌─────────────────────┐
+   SK_Delivery_System.xlsx ──▶│   ingest/           │
+   (Client_List, Delivery_Log,│   excel, schema,    │
+    Time_Windows, Closures,   │   matrix, anova,    │
+    Trucks, Depot,            │   actuals, notes    │
+    Anova Query sheet)        └──────────┬──────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   forecast/         │
+   Anova sensor readings ────▶│   consumption,      │
+   (live + projected stale)   │   demand_model,     │
+                              │   safety_stock      │
+                              └──────────┬──────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+   inventory_state.json ─────▶│   state/            │
+   (atomic v2 persistence)    │   manager,          │
+   plan.json (warm start) ───▶│   warm_start        │
+                              └──────────┬──────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   solver/           │
+                              │   core (OR-Tools),  │
+                              │   objective,        │
+                              │   economics         │
+                              └──────────┬──────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   reporting/        │
+                              │   writers (Excel +  │
+                              │   map), smartservice│
+                              │   diagnostics       │
+                              └──────────┬──────────┘
+                                         │
+                                         ▼
+        sk_irp_schedule.xlsx │ sk_irp_map.html │ sk_irp_smartservice.csv
+```
+
+**Single solver, single entry point.** The OR-Tools CVRP is `solver.core.solve_horizon`. The CLI entry is `run.py`. The web UI is `app.py`. See [adr/ADR-002](adr/ADR-002_Single_Entry_Point.md).
+
+---
+
+## Folder layout
+
+| Path | Purpose |
+|---|---|
+| `app.py` | Flask web UI ("Generate Routes" button + dashboard) |
+| `run.py` | CLI entry — composes the IRP pipeline |
+| `backtest.py` | A/B harness for solver comparison |
+| `config.py` | All tunable constants — change here, nothing else |
+| `inventory.py` | Pure inventory math (project_level, refill, urgency) |
+| `validation.py` | Pre-solve input validation |
+| **`ingest/`** | Data loaders (Excel, schemas, matrix, Anova, actuals, notes) |
+| **`forecast/`** | Demand modeling (consumption rates, empirical-Bayes DOW model, P95 safety stock) |
+| **`state/`** | Inventory state persistence + warm-start (atomic v2 JSON) |
+| **`solver/`** | OR-Tools CVRP, objective calibration, $-economics |
+| **`reporting/`** | Excel + map + SmartService CSV + plan-quality diagnostics |
+| **`scripts/`** | Operational utilities (anova_fetch, refresh_anova, build_matrix, add_client, anova_history) |
+| **`adr/`** | Architecture Decision Records |
+| **`docs/`** | Design notes + history (older IRP_*.md reports) |
+| **`archive/`** | Dead code and legacy entry points kept for reference |
 
 ---
 
 ## Quick start
 
+### Web UI (recommended)
 ```bash
 cd sk_optimizer
-python run_unified.py
+python app.py
+# Open http://localhost:5050
 ```
 
-Outputs land in `output/`:
-- `sk_unified_schedule.xlsx` — one sheet per truck/day + summary + deferred list
-- `sk_unified_map.html` — open in any browser; route polylines drawn on Phoenix map
+Click **Generate Routes**. Toggle **Cold Start** to wipe state and rebuild from scratch.
 
-### Useful flags
-
+### CLI
 ```bash
-python run_unified.py --validate-only            # Check inputs, don't solve
-python run_unified.py --today 2026-04-05         # Solve as-of a specific date
-python run_unified.py --solve-sec 600            # Give the solver 10 minutes
-python run_unified.py --demo                     # Run on the fictional demo dataset
+python run.py                  # plan from tomorrow forward
+python run.py --today 2026-05-08
+python run.py --no-warm-start  # cold start
+python run.py --dry-run        # don't persist plan/state
+python run.py --confirm actuals.csv  # apply driver-confirmed deliveries
 ```
 
-### First-time install (Mac)
-
-```bash
-# Homebrew (if not already installed)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Python 3.12 in its own venv (keeps Anaconda out of the way)
-brew install python@3.12
-/opt/homebrew/bin/python3.12 -m venv ~/sk_venv
-source ~/sk_venv/bin/activate
-
-# Dependencies
-pip install pandas openpyxl ortools folium requests numpy
-```
-
-From then on, just `source ~/sk_venv/bin/activate` before each run.
+### Outputs (in `output/`)
+- `sk_irp_schedule.xlsx` — full schedule per truck/day + summary + stockout-risk + deferred list
+- `sk_irp_map.html` — interactive Folium map with route polylines
+- `sk_irp_smartservice.csv` — importable into S&K's existing dispatch system
 
 ---
 
-## What lives in the Excel file
+## How the rolling horizon works
 
-Everything routable is in `data/SK_Delivery_System.xlsx`. No more constants buried in code.
+Every afternoon the planner runs:
 
-| Sheet | Purpose |
-|---|---|
-| **Client_List** | Master list of restaurants. One row per client. |
-| **Delivery_Log** | Historical deliveries. Append-only. Used to estimate consumption rates. |
-| **Client_Time_Windows** | Per-client open/close hours by day of week (optional). |
-| **Client_Closures** | Date-range closures — vacations, renovations, temp closed (optional). |
-| **Trucks** | Fleet config — capacity, pump rate, setup time per truck. |
-| **Depot** | Depot GPS, shift start/end, load/unload times, work days. |
+1. **Read live state** — atomic v2 `inventory_state.json` (last persisted) overlaid with live Anova sensor data (fresh ≤24h, projected forward for 24-72h stale readings)
+2. **Forecast demand** — empirical-Bayes per-client consumption rates with day-of-week effects; σ̂ tightened for sensor-monitored clients
+3. **Build P95 urgency profiles** — chance-constrained "must visit by" deadlines that respect demand uncertainty
+4. **Warm-start from yesterday's plan** — shifts day indices to match today's calendar; passes prior routes as solver hints
+5. **Solve** the 10-day, 30-vehicle (Truck × Day × Compartment) CVRP with OR-Tools
+6. **Commit days 0-1, preview days 2-9** — first two days are dispatched, the rest are tentative lookahead
+7. **Persist plan + state atomically** — next afternoon's run continues from here
 
-### Adding a new client
-
-Add a row to `Client_List` starting at row 4:
-
-| Col | Field | Example | Required? |
-|---|---|---|---|
-| A | ID | `C158` | yes (prefix with `C`) |
-| B | Customer | `Joe's Diner` | yes |
-| C | Zone | `3` | recommended |
-| D | Zone_Code | `3N` | recommended |
-| E | Street | `123 Main St` | recommended |
-| F | City | `Phoenix` | recommended |
-| G | State | `AZ` | yes |
-| H | Latitude | `33.5152` | **required for routing** |
-| I | Longitude | `-112.1674` | **required for routing** |
-| J | Tank_lbs | `2000` | **required for routing** |
-| K | Product | `CANOLA` or `FRYERS CHOICE` | yes |
-| L | Service_Min | `25` | optional (overrides default) |
-| M | Access_Notes | `gate code 1234` | optional |
-| N | Phone | `602-555-0100` | optional |
-
-No GPS or no tank size → client is automatically deferred with a clear reason.
-
-### Adding a time window
-
-One row per (client, day) pair in `Client_Time_Windows`:
-
-| Client_ID | Day_of_Week | Open_HHMM | Close_HHMM | Notes |
-|---|---|---|---|---|
-| C042 | Tue | 10:00 | 14:00 | No deliveries during lunch rush |
-| C042 | Wed | 10:00 | 14:00 | |
-
-If a client has no rows, they're assumed open all shift. Days not listed for a client are treated as "always open" (add an explicit 00:00–00:00 row to block a day entirely — or use the closure sheet).
-
-### Adding a closure
-
-| Client_ID | Start_Date | End_Date | Reason |
-|---|---|---|---|
-| C042 | 2026-04-20 | 2026-04-27 | Renovations |
-| C101 | 2026-07-01 | 2026-07-07 | Owner vacation |
-
-Inclusive on both ends. The solver skips these clients on those days.
+See [adr/ADR-001_Rolling_Horizon.md](adr/ADR-001_Rolling_Horizon.md).
 
 ---
 
-## Reading the output
+## Key configuration
 
-### Excel — one sheet per truck/day
+All in `config.py`:
 
-Each stop row shows: arrival time, client, product, lbs delivered, compartment used, cumulative miles, urgency color. The **Summary** sheet aggregates the week. The **Deferred** sheet lists every client who didn't make the cut, with a reason code.
-
-### Deferral reason codes
-
-| Code | Meaning | Fix |
+| Constant | Value | Why |
 |---|---|---|
-| `NO_GPS` | Latitude or longitude missing from Client_List | Add GPS to row |
-| `NO_TANK_SIZE` | Tank_lbs missing or ≤ 0 | Add tank size |
-| `NO_CONSUMPTION_DATA` | Not enough delivery history to estimate rate | Log at least 2 real deliveries, or wait for next week |
-| `CLOSED_ALL_WEEK` | Closure covers every day this week | Expected — wait for closure to end |
-| `NO_CAPACITY` | Solver chose to defer — trucks were full this week | Client will resurface next week with higher urgency |
-| `TIME_WINDOW_INFEASIBLE` | Travel time from depot exceeds client's window | Widen window or adjust shift |
-| `SHIFT_OVERFLOW` | No slot fits within shift length | Increase shift minutes in Depot sheet |
-
-### Map
-
-Open `sk_unified_map.html` in any browser. Each truck/day is a colored polyline with numbered stops. Real road geometry when OSRM is reachable, straight lines (dashed) when it isn't.
+| `HORIZON_DAYS` | 10 | Two full work weeks — enough to spread load across the weekend gap |
+| `COMMIT_DAYS` | 2 | Today + tomorrow are firm dispatches; rest is preview |
+| `TRUCKS` | Truck2 (152.6 lbs/min), Truck9 (206.0 lbs/min) | 10K capacity each, 2×5K compartments |
+| `SATURDAY_TRUCKS` | `['Truck2']` | Truck9 does the alternating Tucson/Flagstaff far run |
+| `METRO_CROSS_PENALTY` | 50,000 (~30mi) | Strong deterrent against East→West→East zigzags |
+| `LATE_PENALTY_PER_DAY` | 5,000 | ~3 mi/day late equivalent |
+| `OT_PENALTY_PER_MIN` | 200 | 1.5x labor + push-back against day-0 cramming |
+| `EFFICIENCY_WEIGHT` | 2.5 | Prefer high-fill stops — more lbs per trip |
+| `NEIGHBOR_SWEEP_ENABLED` | True | Catches "neighbor delivered earlier than this client" cases |
 
 ---
 
-## When something's wrong
+## Decisions documented
 
-The validator runs before the solver and prints every problem in plain English, grouped by severity:
-
-```
-⛔ ERRORS (must fix):
-  1. Client_List row 47: C042 has Tank_lbs = 0 (must be > 0)
-  2. Trucks sheet: Truck2 pump_rate_lbs_per_min missing
-
-⚠  WARNINGS (review):
-  1. Delivery_Log has 3 rows with customer names that don't match Client_List
-  2. Client C099 has a time window (08:00–10:00) narrower than depot shift
-
-ℹ  INFO:
-  1. 8 client(s) missing GPS — will be deferred.
-```
-
-Errors block the solve. Warnings don't. Run `--validate-only` to check inputs without burning solver time.
+- [adr/ADR-001_Rolling_Horizon.md](adr/ADR-001_Rolling_Horizon.md) — why a 10-day rolling horizon with 2-day commit
+- [adr/ADR-002_Single_Entry_Point.md](adr/ADR-002_Single_Entry_Point.md) — why one solver and one entry point (this consolidation)
+- [adr/ADR-003_Objective_Wiring.md](adr/ADR-003_Objective_Wiring.md) — why we kept legacy magic constants instead of $-calibrated penalties (for now)
 
 ---
 
-## Running the test suite
+## Operational notes
 
-15 synthetic scenarios where the expected result is hand-computable:
+- **Anova Power Query** must refresh for live sensor data to flow. The `Query` sheet in `SK_Delivery_System.xlsx` is the source of truth; readings >72h old fall back to estimated state.
+- **State drift**: if the system is offline more than a few days, run with **Cold Start** to rebuild from delivery log + sensors.
+- **Excel must be closed** when the solver runs — it writes back to the workbook.
+
+---
+
+## Backtest / A/B testing
 
 ```bash
-python tests/run_tests.py
+python backtest.py            # compare configurations against fixture data
 ```
 
-Covers: trivial one-stop, capacity caps, product splits, urgency priority, hard time windows, closures, missing GPS, shift overflow, depot invariants, double-visit prevention, compartment math, validator happy path, and more. See `tests/README.md` for per-test details.
-
-Before any schema or solver change: run this. If it drops from 15/15, stop and investigate.
-
----
-
-## Tuning knobs
-
-Most knobs now live in `data/SK_Delivery_System.xlsx` (Depot and Trucks sheets). A few behavior switches still live in `config.py`:
-
-| Constant | What it does |
-|---|---|
-| `SOLVE_SEC_WEEK` | Default solver time limit (override with `--solve-sec`) |
-| `CRITICAL_DAYS` / `URGENT_DAYS` | Urgency bucket thresholds (days-until-empty) |
-| `OPPORTUNISTIC_KM` | Max detour to pull a neighbor into a route |
-| `PREFERRED_FILL_PCT` / `SOFT_MIN_FILL_PCT` | Scoring floors for how empty a tank should be |
-| `BALANCE_WEIGHT` | Load-balance vs. pure urgency preference |
-| `COST_PER_MILE` | Fuel + wear estimate used in cost summaries |
-
----
-
-## Project layout
-
-```
-sk_optimizer/
-├── run_unified.py          # Entry point
-├── config.py               # Paths + solver-behavior constants
-├── load_data.py            # Parses Client_List + Delivery_Log
-├── schema_loaders.py       # Parses time windows, closures, trucks, depot
-├── forecast_consumption.py # Per-client lbs/day estimates from history
-├── inventory.py            # Tank-level snapshot as of today
-├── router.py               # OSRM distance/time matrix loader
-├── unified_solver.py       # OR-Tools weekly PVRP solve
-├── validator.py            # Pre-solve input checks with plain-English errors
-├── output.py               # Excel + map generation (with polyline cache)
-├── state.py                # Optional between-run inventory state
-├── data/
-│   ├── SK_Delivery_System.xlsx   # THE input file
-│   ├── osrm_full_matrix_with_ids.npz
-│   └── route_geom_cache.json     # OSRM polyline cache (auto-managed)
-├── output/                       # Schedules + maps land here
-└── tests/
-    ├── test_scenarios.py         # 15 synthetic scenarios
-    ├── run_tests.py              # CLI runner
-    └── README.md
-```
+See `data/backtest_*.json` for fixtures.

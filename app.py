@@ -204,9 +204,9 @@ def get_data_info_full() -> dict:
 def get_latest_outputs() -> dict:
     """
     Return the most recent Excel + map outputs.
-    Distinguishes IRP (sk_irp_*) from legacy unified (sk_unified_*) so the
-    dashboard can show which engine produced what — both files coexist
-    because there are two entry points (run_irp.py vs run_unified.py).
+    The 'unified_*' fields are kept only to surface any historical files
+    left over from the pre-consolidation era (see ADR-002). All current
+    runs produce sk_irp_* files via run.py.
     """
     result = {
         'excel': None, 'map': None,
@@ -391,6 +391,7 @@ def run_optimizer():
     skip_ids  = data.get('skip_ids', [])
     must_ids  = data.get('must_visit_ids', [])
     active_trucks = data.get('active_trucks', TRUCK_NAMES)
+    cold_start = bool(data.get('cold_start', False))
     start_time = time.time()
 
     def generate():
@@ -405,15 +406,28 @@ def run_optimizer():
                 env['SK_ACTIVE_TRUCKS'] = ','.join(active_trucks)
             # The dashboard button now runs the new IRP engine by default.
             # State persistence, time windows, closures, multi-visit,
-            # SmartService CSV export, planning view all hang off run_irp.py.
-            # (The legacy run_unified.py still exists as a CLI fallback —
+            # SmartService CSV export, planning view all hang off run.py.
+            # (The legacy run.py still exists as a CLI fallback —
             # call it directly from the terminal if you ever need it.)
+            # Cold start: back up state + plan so solver rebuilds from scratch
+            if cold_start:
+                _state = DATA_DIR / 'inventory_state.json'
+                _plan  = DATA_DIR / 'plan.json'
+                import shutil
+                if _state.exists():
+                    shutil.copy2(_state, str(_state) + '.pre_cold')
+                    _state.unlink()
+                if _plan.exists():
+                    shutil.copy2(_plan, str(_plan) + '.pre_cold')
+                    _plan.unlink()
             cmd = [
                 sys.executable, '-u',
-                str(BASE_DIR / 'run_irp.py'),
+                str(BASE_DIR / 'run.py'),
                 '--solve-sec', str(solve_sec),
                 '--input-file', str(INPUT_FILE),
             ]
+            if cold_start:
+                cmd.append('--no-warm-start')
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -519,19 +533,25 @@ def settings_route():
 def snapshot_route():
     """Return pre-solve client estimates: who needs oil, urgency, DTE, refill lbs."""
     try:
-        from load_data import load_all
-        from forecast_consumption import estimate_consumption_rates
+        from ingest.excel import load_all
+        from forecast.consumption import estimate_consumption_rates
         from inventory import enrich_snapshot
-        from state import load_state, initialise_state_from_snapshot
+        from state.manager import InventoryState
         from config import STATE_FILE as SF, EXCLUDED_CLIENT_IDS
 
         clients_raw, deliveries = load_all(INPUT_FILE)
         today = pd.Timestamp.today().normalize()
         clients_df = estimate_consumption_rates(deliveries, clients_raw, today=today)
-        state = load_state(SF)
-        if not state:
-            state = initialise_state_from_snapshot(clients_df)
-        snapshot = enrich_snapshot(clients_df, state)
+        # Load v2 atomic state; fall back to delivery-log estimates if empty
+        inv_state = InventoryState.load(SF)
+        state_dict = inv_state.as_dict()
+        if not state_dict:
+            state_dict = {
+                str(row['ID']): float(row['Est_Current_lbs']) if pd.notna(row.get('Est_Current_lbs'))
+                else float(row['Tank_lbs']) * 0.5
+                for _, row in clients_df.iterrows()
+            }
+        snapshot = enrich_snapshot(clients_df, state_dict)
 
         excluded = set(str(x) for x in EXCLUDED_CLIENT_IDS)
         rows = []
@@ -1520,6 +1540,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button class="btn-run" id="runBtn" onclick="runOptimizer()">
       <span>▶</span> Generate Routes
     </button>
+    <div style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;color:#334155;">
+        <input type="checkbox" id="coldStartToggle" style="width:16px;height:16px;cursor:pointer;">
+        Cold Start
+      </label>
+      <div style="font-size:11px;color:#64748b;line-height:1.4;max-width:440px;">
+        <b>Warm start</b> (default): Uses saved inventory state and prior plan as a starting
+        point. Faster solve, more stable routes day-to-day.<br>
+        <b>Cold start</b>: Ignores saved state — rebuilds inventory from delivery history +
+        live Anova sensors. Use after extended downtime, data corrections, or when
+        results look stale.
+      </div>
+    </div>
   </div>
 
   <!-- ── Progress log ── -->
@@ -2016,6 +2049,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       skip_ids: Array.from(skipIds),
       must_visit_ids: Array.from(mustVisitIds),
       active_trucks: Array.from(activeTrucks),
+      cold_start: document.getElementById('coldStartToggle').checked,
     };
 
     fetch('/run', {

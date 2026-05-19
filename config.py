@@ -107,7 +107,33 @@ OT_PENALTY_PER_MIN   = 200
 # solver ignores route geometry chasing penalty avoidance.
 # ~9 miles equivalent at 15,000.  Range: 10,000–25,000 reasonable.
 # 0 = disabled (legacy behavior: day-anonymous objective).
-LATE_PENALTY_PER_DAY = 5_000   # ~3 miles/day late — stronger push toward preferred fill day
+LATE_PENALTY_PER_DAY = 5_000   # Base penalty (in cost units) per day a client is
+                                # served past their preferred fill day. Final
+                                # penalty is multiplied by LATENESS_DTE_TIERS
+                                # below — clients close to stockout get a much
+                                # higher per-day cost than safe clients.
+
+# DTE-tiered lateness multiplier. The OLD code had a binary cliff: mandatory
+# clients (DTE≤1.5) got 100x, everyone else got 1x. That meant a client at
+# DTE=2.5 days was treated identically to a client at DTE=50 days for purposes
+# of "should we delay them?". Result: ~25 clients/run scheduled past their
+# stockout date because the solver saved a few miles of routing detour.
+#
+# The smooth tier below makes lateness cost rise sharply as DTE shrinks:
+#   DTE ≤ 1.5 → 100×  (mandatory; deferral nearly impossible — 500K/day late)
+#   DTE ≤ 3.0 →  30×  (urgent;    150K/day late ≈ 90 miles equivalent)
+#   DTE ≤ 5.0 →  10×  (at-risk;    50K/day late ≈ 30 miles)
+#   DTE ≤ 7.0 →   3×  (caution;    15K/day late ≈ 9 miles)
+#   DTE > 7.0 →   1×  (normal;      5K/day late ≈ 3 miles)
+#
+# Tuple of (max_dte, multiplier) sorted by max_dte ascending.
+LATENESS_DTE_TIERS = (
+    (1.5, 100),
+    (3.0,  30),
+    (5.0,  10),
+    (7.0,   3),
+    (float('inf'), 1),
+)
 
 # Hard deadline slack: how many days past deadline a client can still be
 # assigned via hard constraint. 1 = one day of slack (solver CAN serve a
@@ -193,13 +219,50 @@ OPPORTUNISTIC_FILL_PCT = 0.55  # Opportunistic backfill: if truck is already nea
 # Default radius 12 mi is intentionally generous — covers the case where a
 # parkway-cluster spans ~10 mi (e.g., DILLONS BAYOU at 87th Ave to TAILGATERS
 # LAKE PLEASANT at 101st Ave). Tighten to 6–8 mi for more conservative behavior.
-NEIGHBOR_SWEEP_ENABLED   = False  # OR call: heuristic was duplicating work the objective
-                                  # already does. With fixed_setup_min=18 in the time dim,
-                                  # the solver sees the cost of partial fills. Trust the math.
+NEIGHBOR_SWEEP_ENABLED   = True   # Re-enabled: real-world routes show cross-day
+                                  # geometry was breaking down (e.g., Oregano Pima
+                                  # at 33.627°N being scheduled May 15 when its
+                                  # next-door neighbor State 48 Scottsdale at
+                                  # 33.628°N was being delivered Saturday May 9).
+                                  # The sweep specifically catches "neighbor is
+                                  # being delivered earlier than this client" cases.
 NEIGHBOR_SWEEP_RADIUS_MI = 12.0   # Max haversine miles between neighbors
 NEIGHBOR_SWEEP_MIN_FILL  = 0.50   # Don't pull a client unless tank is ≥50% empty —
-                                  # below that, the per-stop fixed cost (setup + paperwork)
-                                  # outweighs the refill value. A stop must be worth it.
+                                  # below that the tank doesn't have meaningful room.
+                                  # NOTE: This is necessary but NOT sufficient — see
+                                  # NEIGHBOR_SWEEP_MIN_LBS and NEIGHBOR_SWEEP_MAX_DTE
+                                  # below. Three gates work together to prevent the
+                                  # sweep from making uneconomic pulls.
+
+NEIGHBOR_SWEEP_MAX_DTE   = 7.0    # Don't pull a client earlier if they have more
+                                  # than 7 days of oil left. With 20 days of runway,
+                                  # we have many natural opportunities to deliver
+                                  # later — pulling them now wastes pump time on a
+                                  # tank that doesn't need filling. Empirical gain
+                                  # at MAX_DTE=7: −21 mi, −24 OT min, +1,475 lbs,
+                                  # +3.8 lbs/mi productivity vs unfiltered sweep.
+
+NEIGHBOR_SWEEP_MIN_LBS   = 300    # Don't pull a client unless the projected refill
+                                  # is at least 300 lbs. Below this the fixed 18-min
+                                  # setup dominates: a 100-lb delivery costs ~$9/lb
+                                  # in labor (vs ~$1.25/lb at 1,000 lbs). The truck
+                                  # is better off waiting until the client genuinely
+                                  # needs more oil — which a healthy rolling horizon
+                                  # will catch within COMMIT_DAYS+5 = 7 days.
+
+# ── Productivity gate (applies to ALL stops, not just neighbor pulls) ─────────
+# Independent of the neighbor sweep: this gate caps the disjunction penalty
+# for non-urgent clients whose refill would be uneconomic. Without this gate,
+# every client with DTE ≤ horizon gets a 1.5M "must-serve" penalty regardless
+# of refill size, so the solver crams 100-lb stops onto already-overtime trucks.
+# With this gate, clients needing < MIN_PRODUCTIVE_LBS who can wait (DTE >
+# URGENT_DAYS) get a "deep-future" penalty (20K) — easy to defer. They'll be
+# picked up next week when their refill has grown into the productive range.
+MIN_PRODUCTIVE_LBS = 300          # Refill threshold below which a non-urgent
+                                  # stop is considered uneconomic. Solver may
+                                  # still serve them if geography is convenient,
+                                  # but won't sacrifice route quality / overtime
+                                  # to do so.
 
 # ── Scoring / objective weights ───────────────────────────────────────────────
 # Phase-1 visit score:
