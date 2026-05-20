@@ -492,6 +492,90 @@ def status():
     return jsonify({'running': _is_running, **outputs})
 
 
+@app.route('/pick-file', methods=['POST'])
+def pick_file_route():
+    """
+    Open a native OS file picker dialog and return the selected absolute path.
+    macOS: AppleScript via osascript.
+    Windows: PowerShell OpenFileDialog.
+    Linux: zenity.
+
+    Returns {'ok': True, 'path': '...'} on success,
+            {'ok': False, 'cancelled': True} if the user cancelled,
+            {'ok': False, 'error': '...'} on failure.
+    """
+    import platform
+    import subprocess
+    from pathlib import Path as _P
+
+    initial_dir = str(INPUT_FILE.parent) if INPUT_FILE.exists() else str(_P.home())
+    system = platform.system()
+
+    try:
+        if system == 'Darwin':
+            # AppleScript — native macOS file picker, restricted to .xlsx
+            script = (
+                'POSIX path of (choose file '
+                'with prompt "Select your SK_Delivery_System.xlsx file" '
+                'of type {"xlsx", "org.openxmlformats.spreadsheetml.sheet"} '
+                f'default location POSIX file "{initial_dir}")'
+            )
+            proc = subprocess.run(
+                ['osascript', '-e', script],
+                capture_output=True, text=True, timeout=600,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return jsonify({'ok': True, 'path': proc.stdout.strip()})
+            # User cancelled — osascript returns non-zero with 'User canceled.'
+            if 'cancel' in (proc.stderr or '').lower():
+                return jsonify({'ok': False, 'cancelled': True})
+            return jsonify({'ok': False, 'error': proc.stderr.strip() or 'Picker failed'})
+
+        elif system == 'Windows':
+            ps = (
+                'Add-Type -AssemblyName System.Windows.Forms; '
+                '$d = New-Object System.Windows.Forms.OpenFileDialog; '
+                '$d.Filter = "Excel files (*.xlsx)|*.xlsx"; '
+                f'$d.InitialDirectory = "{initial_dir}"; '
+                '$d.Title = "Select your SK_Delivery_System.xlsx file"; '
+                'if ($d.ShowDialog() -eq "OK") { Write-Output $d.FileName }'
+            )
+            proc = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps],
+                capture_output=True, text=True, timeout=600,
+            )
+            path = (proc.stdout or '').strip()
+            if path:
+                return jsonify({'ok': True, 'path': path})
+            return jsonify({'ok': False, 'cancelled': True})
+
+        else:
+            # Linux — try zenity, then kdialog
+            for cmd in (
+                ['zenity', '--file-selection',
+                 '--title=Select your SK_Delivery_System.xlsx file',
+                 '--file-filter=Excel files (*.xlsx) | *.xlsx',
+                 f'--filename={initial_dir}/'],
+                ['kdialog', '--getopenfilename', initial_dir, '*.xlsx'],
+            ):
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        return jsonify({'ok': True, 'path': proc.stdout.strip()})
+                    if proc.returncode != 0:
+                        # User cancelled or tool not found — try next
+                        continue
+                except FileNotFoundError:
+                    continue
+            return jsonify({'ok': False,
+                            'error': 'No file picker available. Install zenity or kdialog.'})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'error': 'File picker timed out'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'{type(e).__name__}: {e}'})
+
+
 @app.route('/settings', methods=['GET', 'POST'])
 def settings_route():
     """Get or save per-machine settings (persists in local_config.json)."""
@@ -2357,8 +2441,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       This is saved locally and won't affect other machines.
     </div>
     <div class="modal-label">File Path</div>
-    <input class="modal-input" id="settingsPath" type="text"
-           placeholder="C:\\Users\\...\\SK_Delivery_System.xlsx" spellcheck="false">
+    <div style="display:flex; gap:8px; align-items:stretch;">
+      <input class="modal-input" id="settingsPath" type="text"
+             placeholder="/Users/.../SK_Delivery_System.xlsx" spellcheck="false"
+             style="flex:1; margin:0;">
+      <button type="button" class="modal-btn"
+              onclick="browseFile()" id="settingsBrowse"
+              style="background:#475569; color:white; border:none; padding:0 14px; border-radius:6px; cursor:pointer; white-space:nowrap;">
+        Browse…
+      </button>
+    </div>
     <div class="modal-msg" id="settingsMsg"></div>
     <div class="modal-actions">
       <button class="modal-btn modal-btn-cancel" onclick="closeSettings()">Cancel</button>
@@ -2379,6 +2471,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   function closeSettings() {
     document.getElementById('settingsModal').classList.remove('open');
+  }
+
+  function browseFile() {
+    var btn = document.getElementById('settingsBrowse');
+    var msg = document.getElementById('settingsMsg');
+    var inp = document.getElementById('settingsPath');
+    btn.disabled = true;
+    btn.textContent = 'Opening…';
+    msg.className = 'modal-msg';
+    msg.textContent = 'A file picker window is opening — it may be behind your browser.';
+    fetch('/pick-file', {method: 'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        btn.disabled = false;
+        btn.textContent = 'Browse…';
+        if (d.ok && d.path) {
+          inp.value = d.path;
+          msg.className = 'modal-msg ok';
+          msg.textContent = 'File selected. Click Save to apply.';
+        } else if (d.cancelled) {
+          msg.className = 'modal-msg';
+          msg.textContent = '';
+        } else {
+          msg.className = 'modal-msg err';
+          msg.textContent = d.error || 'Could not open file picker.';
+        }
+      })
+      .catch(function(){
+        btn.disabled = false;
+        btn.textContent = 'Browse…';
+        msg.className = 'modal-msg err';
+        msg.textContent = 'Network error — is the app running?';
+      });
   }
 
   document.getElementById('settingsModal').addEventListener('click', function(e) {
