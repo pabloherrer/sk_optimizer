@@ -1,0 +1,35 @@
+# ==============================================================================
+# Economic parameters — all in real dollars per natural unit.
+# These are the only "cost" knobs in the entire system.
+# ==============================================================================
+
+# Fuel + wear per truck-mile driven.
+cost_per_mile: 0.55
+
+# Loaded labor cost per minute of driver time (regular hours).
+# Default ~$50/hour. Includes wages + benefits + workers comp + small overhead.
+cost_per_minute_labor: 0.83
+
+# Overtime premium multiplier (applied to minutes past the 8h target).
+# 1.5 = "time and a half".
+overtime_multiplier: 1.5
+
+# Fixed cost of dispatching a truck on a given day.
+# Reality check: drivers are typically on weekly salary, so idling a truck
+# does NOT save labor. Real dispatch cost is small (warm-up + paperwork +
+# vehicle wear), not "a day of driver wages."
+# Was 50.0 — at that level, Truck2 was idled 6 of 8 weekdays because the
+# $50 saving outweighed the marginal value of a second truck. Lowering to
+# $10 reflects the operational reality.
+truck_dispatch_cost: 10.0
+
+# Penalty per pound-day of stockout shortfall (soft constraint).
+# A 50-lb tank deficit for 2 days costs $10 × 50 × 2 = $1,000.
+# Set high enough that the solver almost always avoids stockouts,
+# but finite enough that hard infeasibility never occurs.
+stockout_cost_per_lb_day: 10.0
+
+# Terminal reward: dollars per pound of inventory left in tanks at horizon end.
+# Encourages "leave tanks full" at end of plan — prevents the cliff effect
+# where solver dumps everything in Day 0 and ignores Day 9+.
+terminal_value_per_lb: 0.10

@@ -1,0 +1,50 @@
+# ==============================================================================
+# Fleet configuration — trucks, depot, working hours.
+# Rarely changes. Operator-editable only.
+# ==============================================================================
+
+depot:
+  id: DEPOT
+  lat: 33.5152
+  lon: -112.1674
+
+trucks:
+  - id: Truck2
+    capacity_lbs: 10000               # Total truck capacity
+    compartments:
+      - id: A
+        capacity_lbs: 5000             # One product per compartment
+      - id: B
+        capacity_lbs: 5000
+    pump_rate_lbs_per_min: 152.6
+    fixed_setup_min: 18                # Per-stop hose+paperwork
+
+  - id: Truck9
+    capacity_lbs: 10000
+    compartments:
+      - id: A
+        capacity_lbs: 5000
+      - id: B
+        capacity_lbs: 5000
+    pump_rate_lbs_per_min: 206.0       # 35% faster than Truck2
+    fixed_setup_min: 18
+
+# ── Working hours ────────────────────────────────────────────────────────────
+shift:
+  start_hour: 6                        # Drivers leave depot at 6 AM
+  target_minutes: 480                  # 8h target — overtime beyond this
+  hard_max_minutes: 720                # 12h hard cap (no exceptions)
+  weekly_max_minutes: 2400             # 40h/week per driver
+
+# ── Active days ──────────────────────────────────────────────────────────────
+working_days: ['Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+# ── Saturday rule ────────────────────────────────────────────────────────────
+# Every Saturday Truck9 runs the alternating far-cluster route (Tucson one
+# Saturday, Flagstaff the next). For metro planning: Saturday = Truck2 only.
+saturday_trucks: ['Truck2']
+
+# ── Products ─────────────────────────────────────────────────────────────────
+products:
+  - CANOLA
+  - FRYERS CHOICE

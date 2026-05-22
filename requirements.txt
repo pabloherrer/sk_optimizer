@@ -1,11 +1,24 @@
 # S&K Route Optimizer — Python dependencies
-# Pinned to exact working versions — do not change without testing.
+# Pinned to working versions — do not change without testing.
 # Install with:  pip install -r requirements.txt
 
+# Web dashboard
 flask==3.1.1
+
+# Data + Excel
 openpyxl==3.1.5
 pandas==2.3.3
 numpy==2.2.6
-folium==0.20.0
+
+# Solver
 ortools==9.15.6755
+
+# Config validation (v2/schemas.py — Pydantic AppConfig)
+pydantic>=2.10,<3.0
+pyyaml>=6.0
+
+# Mapping (route_map.html)
+folium==0.20.0
+
+# OSRM HTTP fetches (matrix refresh, polyline cache)
 requests==2.33.1

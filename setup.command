@@ -2,6 +2,7 @@
 # ============================================================
 # S&K Route Optimizer — First-Time Setup (Mac / Linux)
 # Double-click this file (or run: bash setup.command)
+# Creates .venv and installs dependencies.
 # ============================================================
 
 cd "$(dirname "$0")"
@@ -12,11 +13,7 @@ echo "  S&K Route Optimizer — Setup"
 echo "================================================"
 echo ""
 
-# ── Check Python ─────────────────────────────────
-# Search for Python 3.10+ in order of preference:
-#   1. Homebrew versioned installs (python3.13 → python3.10)
-#   2. Homebrew generic python3
-#   3. System python3 / python
+# ── Find Python 3.10–3.13 ────────────────────────
 PYTHON_CMD=""
 for try_cmd in python3.13 python3.12 python3.11 python3.10; do
     if command -v "$try_cmd" &>/dev/null; then
@@ -24,7 +21,6 @@ for try_cmd in python3.13 python3.12 python3.11 python3.10; do
         break
     fi
 done
-# Also check Homebrew paths directly (not always on PATH)
 if [ -z "$PYTHON_CMD" ]; then
     for brew_py in /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 \
                    /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3.10 \
@@ -36,28 +32,18 @@ if [ -z "$PYTHON_CMD" ]; then
         fi
     done
 fi
-# Fallback to generic python3 / python
 if [ -z "$PYTHON_CMD" ]; then
-    if command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    elif command -v python &>/dev/null; then
-        PYTHON_CMD="python"
+    if command -v python3 &>/dev/null; then PYTHON_CMD="python3"
+    elif command -v python &>/dev/null; then PYTHON_CMD="python"
     fi
 fi
-
 if [ -z "$PYTHON_CMD" ]; then
     echo "ERROR: Python is not installed."
     echo ""
-    echo "Install Python 3.12 with one of these methods:"
+    echo "Install Python 3.12 with:"
+    echo "  brew install python@3.12"
+    echo "Or download from:  https://www.python.org/downloads/"
     echo ""
-    echo "  Option A — Homebrew (recommended):"
-    echo "    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-    echo "    brew install python@3.12"
-    echo ""
-    echo "  Option B — Download from python.org:"
-    echo "    https://www.python.org/downloads/"
-    echo ""
-    echo "Then run this setup again."
     read -p "Press Enter to close..."
     exit 1
 fi
@@ -66,45 +52,34 @@ PY_VERSION=$($PYTHON_CMD --version 2>&1)
 echo "Found: $PY_VERSION"
 echo ""
 
-# ── Check Python version is 3.10–3.13 ────────────
 PY_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.minor)")
 PY_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.major)")
 if [ "$PY_MAJOR" -lt 3 ] || [ "$PY_MINOR" -lt 10 ]; then
-    echo "ERROR: Python 3.10 or newer is required (found $PY_VERSION)."
-    echo "Please install Python 3.12:"
-    echo "  brew install python@3.12"
+    echo "ERROR: Python 3.10+ is required (found $PY_VERSION)."
     read -p "Press Enter to close..."
     exit 1
 fi
 if [ "$PY_MINOR" -gt 13 ]; then
-    echo "ERROR: Python 3.$PY_MINOR is too new — our packages don't support it yet."
-    echo ""
-    echo "Please install Python 3.12:"
-    echo "  brew install python@3.12"
-    echo ""
-    echo "Then delete the sk_venv folder and run this again."
+    echo "ERROR: Python 3.$PY_MINOR is too new — packages don't support it yet."
+    echo "Please install Python 3.12:  brew install python@3.12"
     read -p "Press Enter to close..."
     exit 1
 fi
 
-# ── Check Git ─────────────────────────────────────
+# ── Git (for updates) ─────────────────────────────
 if ! command -v git &>/dev/null; then
-    echo "WARNING: Git is not installed."
-    echo "You won't be able to receive updates."
-    echo ""
+    echo "WARNING: Git is not installed. You won't be able to update."
     echo "Install Git with:  brew install git"
-    echo "  or download from: https://git-scm.com/download/mac"
-    echo ""
     echo "Continuing setup without Git..."
     echo ""
 fi
 
-# ── Create virtual environment ────────────────────
-if [ -d "sk_venv" ]; then
-    echo "Virtual environment already exists — skipping creation."
+# ── Create .venv ──────────────────────────────────
+if [ -d ".venv" ]; then
+    echo "Virtual environment (.venv) already exists — skipping creation."
 else
     echo "Creating virtual environment..."
-    $PYTHON_CMD -m venv sk_venv
+    $PYTHON_CMD -m venv .venv
     if [ $? -ne 0 ]; then
         echo "ERROR: Could not create virtual environment."
         read -p "Press Enter to close..."
@@ -117,8 +92,8 @@ echo ""
 # ── Install dependencies ──────────────────────────
 echo "Installing dependencies (this may take 2-3 minutes)..."
 echo ""
-sk_venv/bin/pip install --upgrade pip --quiet
-sk_venv/bin/pip install -r requirements.txt
+.venv/bin/pip install --upgrade pip --quiet
+.venv/bin/pip install -r requirements.txt
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Dependency installation failed."
@@ -127,9 +102,10 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# ── Make launcher executable ──────────────────────
+# ── Make launchers executable ─────────────────────
 chmod +x "Launch Optimizer.command" 2>/dev/null
 chmod +x "Update Optimizer.command" 2>/dev/null
+chmod +x "setup.command" 2>/dev/null
 
 echo ""
 echo "================================================"
@@ -139,6 +115,6 @@ echo ""
 echo "To start the optimizer:"
 echo "  Double-click \"Launch Optimizer.command\""
 echo ""
-echo "(If macOS blocks it: right-click -> Open -> Open)"
+echo "(If macOS blocks it: right-click → Open → Open)"
 echo ""
 read -p "Press Enter to close..."
