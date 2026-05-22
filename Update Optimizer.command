@@ -2,6 +2,7 @@
 # ============================================================
 # S&K Route Optimizer — Update (Mac / Linux)
 # Double-click to pull the latest version from GitHub.
+# Preserves local data + dashboard overrides.
 # ============================================================
 
 cd "$(dirname "$0")"
@@ -24,14 +25,11 @@ if ! command -v git &>/dev/null; then
 fi
 
 # ── Clean up any in-progress merge/rebase from a previous failure ──
-# This is the #1 reason updates fail: a prior pull was interrupted
-# (network drop, Ctrl-C, conflict) and left the repo in an unmerged
-# state. Abort silently — if nothing was in progress these are no-ops.
 git merge --abort 2>/dev/null
 git rebase --abort 2>/dev/null
 
-# ── Stash any local changes to data files ─────────
-echo "Saving any local data changes..."
+# ── Stash any local changes ───────────────────────
+echo "Saving local changes..."
 STASH_BEFORE=$(git stash list 2>/dev/null | wc -l)
 git stash push --include-untracked --quiet --message "auto-update-stash" 2>/dev/null
 STASH_AFTER=$(git stash list 2>/dev/null | wc -l)
@@ -40,9 +38,8 @@ if [ "$STASH_AFTER" -gt "$STASH_BEFORE" ]; then
     STASHED=1
 fi
 
-# ── Pull latest version ───────────────────────────
+# ── Pull latest ───────────────────────────────────
 echo "Downloading latest version from GitHub..."
-echo "  https://github.com/pabloherrer/sk_optimizer"
 echo ""
 PULL_OUT=$(git pull origin main 2>&1)
 PULL_RC=$?
@@ -54,22 +51,24 @@ if [ $PULL_RC -ne 0 ]; then
     echo "  Update failed — see git message above"
     echo "================================================"
 
-    # Diagnose: what kind of error?
     if echo "$PULL_OUT" | grep -qiE "could not resolve host|name resolution|timed? ?out|network is unreachable|failed to connect"; then
-        echo "  Reason: NETWORK problem — check your internet connection."
+        echo "  Reason: NETWORK — check your internet connection."
     elif echo "$PULL_OUT" | grep -qiE "authentication|permission denied|403|401"; then
-        echo "  Reason: AUTHENTICATION failed — your GitHub credentials may have expired."
+        echo "  Reason: AUTHENTICATION — your GitHub credentials may have expired."
     elif echo "$PULL_OUT" | grep -qiE "unmerged|conflict|merge.*aborted|exiting because of an unresolved conflict"; then
         echo "  Reason: MERGE CONFLICT from a previous interrupted update."
         echo ""
         echo "  → Attempting automatic recovery..."
-        # Restore stash first so we don't lose data
         [ $STASHED -eq 1 ] && git stash pop --quiet 2>/dev/null
-        # Hard reset to origin/main (discards local CODE edits, keeps data via stash flow)
         echo "  Saving data files aside..."
         mkdir -p /tmp/sk_recovery_$$
-        for f in data/SK_Delivery_System.xlsx data/inventory_state.json data/plan.json local_config.json; do
-            [ -f "$f" ] && cp "$f" /tmp/sk_recovery_$$/$(basename "$f")
+        # Files that MUST survive an update — operator data, not code
+        for f in local_config.json \
+                 data/inventory_state_final.json \
+                 data/user_overrides.json \
+                 data/route_geom_cache.json \
+                 data/osrm_full_matrix_with_ids.npz; do
+            [ -f "$f" ] && cp "$f" /tmp/sk_recovery_$$/"$(basename "$f")"
         done
         echo "  Resetting to clean state..."
         git reset --hard HEAD 2>/dev/null
@@ -79,8 +78,13 @@ if [ $PULL_RC -ne 0 ]; then
         RC=$?
         echo "  Restoring data files..."
         for f in /tmp/sk_recovery_$$/*; do
-            [ -f "$f" ] && cp "$f" data/$(basename "$f") 2>/dev/null
-            [ -f "$f" ] && [ "$(basename $f)" = "local_config.json" ] && cp "$f" ./
+            base="$(basename "$f")"
+            if [ "$base" = "local_config.json" ]; then
+                cp "$f" ./
+            else
+                mkdir -p data
+                cp "$f" data/"$base"
+            fi
         done
         rm -rf /tmp/sk_recovery_$$
         if [ $RC -eq 0 ]; then
@@ -107,7 +111,7 @@ if [ $PULL_RC -ne 0 ]; then
     fi
 fi
 
-# ── Restore local changes ─────────────────────────
+# ── Restore stashed changes ───────────────────────
 if [ $STASHED -eq 1 ]; then
     POP_OUT=$(git stash pop 2>&1)
     if echo "$POP_OUT" | grep -qiE "conflict|merge"; then
@@ -120,11 +124,12 @@ if [ $STASHED -eq 1 ]; then
     fi
 fi
 
-# ── Update dependencies if requirements changed ───
-if [ -d "sk_venv" ]; then
+# ── Update dependencies ───────────────────────────
+if [ -d ".venv" ]; then
     echo ""
     echo "Checking dependencies..."
-    sk_venv/bin/pip install -r requirements.txt --quiet
+    .venv/bin/pip install --upgrade pip --quiet
+    .venv/bin/pip install -r requirements.txt --quiet
     if [ $? -ne 0 ]; then
         echo ""
         echo "  ⚠ Dependency update failed."
@@ -134,7 +139,7 @@ if [ -d "sk_venv" ]; then
     fi
 else
     echo ""
-    echo "  ⚠ Virtual environment not found."
+    echo "  ⚠ Virtual environment (.venv) not found."
     echo "  Run setup.command to complete installation."
 fi
 

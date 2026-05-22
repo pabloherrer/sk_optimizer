@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>S&amp;K Route Dispatch</title>
+  <link rel="icon" type="image/png" href="/static/sk-logo.png">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Run progress bar (only visible during/just after a solve) -->
+<div id="progress-bar" class="progress-bar" hidden>
+  <div id="progress-fill" class="progress-fill"></div>
+  <div id="progress-label" class="progress-label"></div>
+</div>
+
+<!-- ═══════════════════════════════ TOP BAR ═══════════════════════════════ -->
+<header class="top-bar">
+  <div class="top-bar-left">
+    <img src="/static/sk-logo.png" alt="S&amp;K Oil Sales" class="logo">
+    <div class="brand">
+      <div class="brand-name">S&amp;K Route Dispatch</div>
+      <div class="brand-sub">Better Oil · Better Food</div>
+    </div>
+  </div>
+  <div class="top-bar-right">
+    <div class="control-group">
+      <label for="plan-date">First delivery day</label>
+      <input type="date" id="plan-date" value="{{ default_date }}">
+    </div>
+    <div class="control-group">
+      <label for="solve-secs">Solve budget</label>
+      <select id="solve-secs">
+        <option value="60">60s · quick</option>
+        <option value="120" selected>2 min · standard</option>
+        <option value="180">3 min · thorough</option>
+        <option value="300">5 min · max</option>
+      </select>
+    </div>
+    <button id="run-btn" class="btn-primary">▶ Run</button>
+    <div id="run-status" class="status-pill status-idle">Ready</div>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════ DATA STRIP ═══════════════════════════════ -->
+<section class="data-strip" id="data-strip">
+  <div class="strip-left">
+    <span class="strip-label">Data file</span>
+    <span class="strip-file" id="strip-file" title="">…</span>
+    <button id="browse-btn" class="btn-mini-flat">📂 Browse</button>
+  </div>
+  <div class="strip-right" id="strip-stats">
+    <span class="strip-stat" id="stat-mtime">—</span>
+    <span class="strip-stat" id="stat-deliv">—</span>
+    <span class="strip-stat" id="stat-anova">—</span>
+    <span class="strip-stat" id="stat-clients">—</span>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════ HORIZON BANNER ═══════════════════════════════ -->
+<section class="horizon-banner">
+  <span class="banner-icon">📅</span>
+  <span class="banner-text">
+    <b>How this works:</b>
+    The optimizer plans <b><span id="horizon-days">10</span> working days</b> ahead.
+    The first <b><span id="commit-days">2</span> days are firm</b> (dispatch these now).
+    The rest is a <b>preview</b> — it will be re-solved when you re-run tomorrow.
+  </span>
+</section>
+
+<!-- ═══════════════════════════════ MAIN GRID ═══════════════════════════════ -->
+<main class="dashboard">
+
+  <!-- LEFT: CLIENT BROWSER (dominant) -->
+  <section class="card card-clients">
+    <header class="card-header">
+      <h2>Clients</h2>
+      <span class="card-hint" id="client-count">—</span>
+    </header>
+    <div class="card-body card-body-clients">
+      <div class="client-toolbar">
+        <input type="search" id="client-search" placeholder="Search by name or ID…">
+        <select id="client-sort">
+          <option value="dte">Sort: most urgent first</option>
+          <option value="name">Sort: name A→Z</option>
+          <option value="id">Sort: ID</option>
+        </select>
+        <select id="client-filter">
+          <option value="all">Show: all clients</option>
+          <option value="urgent">Show: DTE &lt; 5 days</option>
+          <option value="anova">Show: Anova sensor</option>
+          <option value="overrides">Show: my overrides</option>
+        </select>
+      </div>
+      <div class="client-table-wrap">
+        <table class="client-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Customer</th>
+              <th class="num">Tank</th>
+              <th class="num">Now</th>
+              <th class="num">%</th>
+              <th class="num" title="Solver rate — IQR-filtered from history">Rate</th>
+              <th class="num">DTE</th>
+              <th>Last delivery</th>
+              <th>Anova</th>
+              <th id="action-col-header" title="Force the optimizer to schedule (or skip) this client on the First-Delivery-Day date selected at the top of the page. Click again to clear.">
+                Manual override
+                <span style="color:var(--text-faint);font-weight:400" id="action-col-date"></span>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="client-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- RIGHT: SIDEBAR -->
+  <aside class="sidebar">
+
+    <!-- Truck Availability -->
+    <section class="card card-trucks">
+      <header class="card-header">
+        <h2>Trucks Available</h2>
+        <span class="card-hint">Click to toggle off-days</span>
+      </header>
+      <div class="card-body card-body-trucks" id="trucks-body">
+        <div class="loading">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Last Plan (KPIs + downloads + day breakdown) -->
+    <section class="card card-plan">
+      <header class="card-header">
+        <h2>Last Plan</h2>
+        <span class="card-hint" id="plan-stamp"></span>
+      </header>
+      <div class="card-body" id="plan-body">
+        <div class="empty">No plan yet — click <b>Run</b> to build one.</div>
+      </div>
+    </section>
+
+  </aside>
+
+</main>
+
+<!-- ═══════════════════════════════ FOOTER ═══════════════════════════════ -->
+<footer class="bottom-bar">
+  <span>S&amp;K Route Optimizer · sk_solver_final</span>
+  <span id="last-run-info"></span>
+</footer>
+
+<!-- Run log modal — opened from Last Plan card. Closeable by:
+     · Close button   · Click outside (backdrop)   · Escape key  -->
+<div class="modal-backdrop" id="run-log-modal" hidden onclick="closeRunLogIfBackdrop(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <header class="modal-header">
+      <h3>Run log</h3>
+      <button class="btn-mini-flat" onclick="closeRunLog()">Close</button>
+    </header>
+    <pre id="run-log" class="run-log"></pre>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

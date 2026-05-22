@@ -1,0 +1,53 @@
+# ==============================================================================
+# Policy parameters — business rules for HOW we want to deliver.
+# These are decisions, not magic. Operator-editable.
+# ==============================================================================
+
+# ── Planning horizon ─────────────────────────────────────────────────────────
+horizon_days: 10                       # Days to plan ahead
+commit_days: 2                         # Days locked in (rest is preview)
+
+# ── Minimum economic stop size ───────────────────────────────────────────────
+# The solver will EITHER deliver at least this much, or skip the client today.
+# Prevents 26-lb-detour absurdities.
+# Choose: roughly the smallest delivery that justifies the 18-min setup.
+min_stop_lbs: 200
+
+# ── Safety reserve ───────────────────────────────────────────────────────────
+# SAFETY FLOOR — never let tank fall below this. Below this level,
+# stockout penalty fires in the solver. This is the REAL hard floor,
+# distinct from `target_empty_fraction` below (which decides when we
+# WANT to visit). A tank can pass through here if consumption is much
+# faster than forecast — but the solver pays a heavy penalty.
+min_reserve_fraction: 0.10
+
+# ── Target visit timing ──────────────────────────────────────────────────────
+# How "empty" a tank should be before we visit — drives bigger refills naturally.
+# Note: this is a TARGET, not a hard floor. Solver may visit earlier if the
+# route geometry strongly favors it (e.g., neighbor is being delivered).
+target_empty_fraction: 0.70            # Visit when tank is ~70% empty
+                                       # (i.e., tank at ~30% full)
+
+# ── Forecast safety ──────────────────────────────────────────────────────────
+# Inflate consumption rate by this many days of safety stock.
+# Higher = more conservative (visit clients earlier).
+# Recommended: use 75th-percentile consumption rate, not median.
+consumption_percentile: 0.75
+
+# ── Team routing ─────────────────────────────────────────────────────────────
+# If two trucks visit the same geographic cluster on the same day, penalize.
+# Setting to 0 disables team-routing pressure.
+# Setting too high may cause one truck to wait when both should be working.
+team_overlap_penalty_dollars: 100.0
+
+# ── Geographic clustering ────────────────────────────────────────────────────
+# Pre-pass that assigns each client a "home cluster" via k-means on lat/lon.
+# k=2 → two territories (one per truck). Soft anchor only — solver can cross.
+num_territory_clusters: 2
+
+# ── Override behavior ────────────────────────────────────────────────────────
+# When operator overrides conflict with feasibility (e.g., Pin a client where
+# capacity is full), what do we do?
+#   'abort'    — refuse to solve, ask operator to fix
+#   'relax'    — soften the override to a hint, solve anyway, flag in report
+override_conflict_policy: 'relax'
