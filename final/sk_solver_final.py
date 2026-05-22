@@ -311,10 +311,17 @@ def build_augmented_problem(
     # Apply per-day truck unavailability (dashboard "Trucks available" widget).
     # Marks (date, truck_id) pairs as not dispatched. Stacks on top of the
     # base Saturday rule (Truck9 already unavailable on Saturdays).
+<<<<<<< HEAD
     truck_unavail_file = (
         Path(__file__).resolve().parent.parent / 'data' / 'truck_unavailable.json'
     )
     if truck_unavail_file.exists():
+=======
+    truck_unavail_file = base.run_id.__class__ is str and (
+        Path(__file__).resolve().parent.parent / 'data' / 'truck_unavailable.json'
+    )
+    if truck_unavail_file and truck_unavail_file.exists():
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
         from final.app.availability_store import load_unavailability
         unavailable = load_unavailability(truck_unavail_file)
         if unavailable:
@@ -356,10 +363,15 @@ def build_augmented_problem(
     #   75p rate for forward projection in refills_by_day so future-day
     #   refills still have a safety margin.
     sheet_current = _load_sheet_est_current(input_file)
+<<<<<<< HEAD
     # Build tank-cap lookup for sanity-checking spreadsheet values.
     tank_cap_by_id = {c.id: float(c.tank_capacity_lbs) for c in base.clients}
     updated_tanks: Dict[str, TankState] = {}
     n_increased = n_unchanged = n_current_aligned = n_sheet_bad = 0
+=======
+    updated_tanks: Dict[str, TankState] = {}
+    n_increased = n_unchanged = n_current_aligned = 0
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
     for cid, ts in base.initial_tanks.items():
         new_ts = ts
         # Rate update (recency-weighted, only if higher than existing)
@@ -378,6 +390,7 @@ def build_augmented_problem(
         # measurements and should always win.
         if new_ts.source == 'estimated' and cid in sheet_current:
             sheet_val = sheet_current[cid]
+<<<<<<< HEAD
             tank_cap = tank_cap_by_id.get(cid, 0.0)
             # SANITY CHECK: reject obviously-bad spreadsheet values
             # (negative, way over tank cap, NaN). These have been observed
@@ -389,6 +402,10 @@ def build_augmented_problem(
             elif abs(sheet_val - new_ts.current_lbs) > 5:
                 clamped = max(0.0, min(tank_cap, float(sheet_val)))
                 new_ts = replace(new_ts, current_lbs=clamped,
+=======
+            if sheet_val is not None and abs(sheet_val - new_ts.current_lbs) > 5:
+                new_ts = replace(new_ts, current_lbs=float(sheet_val),
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
                                   source='estimated (spreadsheet)')
                 n_current_aligned += 1
         updated_tanks[cid] = new_ts
@@ -397,9 +414,12 @@ def build_augmented_problem(
     if n_current_aligned:
         print(f"  Current-level aligned to spreadsheet for {n_current_aligned} clients "
               f"(prevents overflow from rate-driven under-estimation)")
+<<<<<<< HEAD
     if n_sheet_bad:
         print(f"  ⚠ Ignored {n_sheet_bad} spreadsheet est_current values that were "
               f"out-of-range (negative or > tank capacity)")
+=======
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
 
     # SHIFT CONFIGURATION — operator-confirmed truth (overrides the Depot sheet)
     #
@@ -827,6 +847,7 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
     # offset of each horizon day, NOT its working-day index. Without this
     # fix, a client with 4 days supply could be scheduled day_idx=4 (Thu
     # May 28 = 6 calendar days later) → 2 days of being dry.
+<<<<<<< HEAD
     #
     # Also: if NO horizon day satisfies the constraint (e.g. client already
     # dry AND the only allowed days are forbidden), warn loudly. Without
@@ -834,6 +855,9 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
     # disjunction's drop penalty, with no clear "why."
     DRY_DAY_GRACE = 1
     unschedulable_urgent: List[str] = []
+=======
+    DRY_DAY_GRACE = 1
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
     for i, c in enumerate(pool):
         node_idx = manager.NodeToIndex(i + 1)
         ts = problem.initial_tanks[c.id]
@@ -842,12 +866,16 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
             continue
         days_supply = float(ts.current_lbs) / rate
         max_cal_days_allowed = days_supply + DRY_DAY_GRACE
+<<<<<<< HEAD
         n_kept = 0
+=======
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
         for v in range(n_vehicles):
             _, day_idx = v2td(v)
             if cal_days_to_d[day_idx] > max_cal_days_allowed:
                 try: routing.VehicleVar(node_idx).RemoveValue(v)
                 except Exception: pass
+<<<<<<< HEAD
             else:
                 n_kept += 1
         # If we just blew away every vehicle for a low-supply client, the
@@ -861,6 +889,8 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
               f"day in horizon — will be deferred. Investigate:")
         for cid in unschedulable_urgent[:10]:
             print(f"    - {cid}")
+=======
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
 
     # (b), (c), (d) — refill-driven forbids
     for i, c in enumerate(pool):

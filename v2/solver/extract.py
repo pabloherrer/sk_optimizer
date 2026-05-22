@@ -151,10 +151,14 @@ def extract_plan(
                 # the dispatcher would see if they checked right now.
                 # NOT the projected-at-arrival value.
                 current_lbs_today=round(float(ts.current_lbs), 1),
+<<<<<<< HEAD
                 # CALENDAR days from today to arrival — NOT the working-day
                 # horizon index. The driver wants "deliver in 4 days" not
                 # "the 4th truck-day in the plan."
                 days_to_arrival=int(cal_days_to_arrival),
+=======
+                days_to_arrival=int(day_idx),
+>>>>>>> caeda64909d41943ae38b06ce9168d27c26fc964
                 level_at_arrival_lbs=round(level_at_arrival, 1),
                 delivery_lbs=refill,
                 level_after_lbs=round(level_after, 1),
