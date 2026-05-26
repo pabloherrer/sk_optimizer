@@ -716,8 +716,12 @@ def _stockout_block(
             if next_visit is not None:
                 rd, tid = next_visit
                 days_dry_before_visit = (rd - d).days - 1   # full days w/o oil
-                # If next visit is tomorrow — driver is coming, not actionable
-                if days_dry_before_visit < 1:
+                # If next visit is tomorrow (days_dry == 0) — driver is
+                # coming. Skip from at-risk list UNLESS the client is
+                # ALREADY EMPTY on day d (any further delay = real dry
+                # time). Empty-today clients always appear so the
+                # dispatcher knows to call them.
+                if days_dry_before_visit < 1 and dte_at_d > 0.5:
                     continue
                 sched_label = rd.strftime('%a %b %d')
                 truck_label = tid

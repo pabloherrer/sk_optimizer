@@ -584,11 +584,25 @@ def api_overrides_post():
     forbids = [f for f in current.get('forbids', []) if f.get('client_id') != cid]
 
     if action == 'pin' and d_str:
+        # Pin = "must visit on THIS specific date". Single day.
         pins.append({'client_id': cid, 'date': d_str,
                      'reason': 'dashboard pin', 'created_at': datetime.now().isoformat()})
     elif action == 'skip' and d_str:
-        forbids.append({'client_id': cid, 'dates': [d_str],
-                        'reason': 'dashboard skip', 'created_at': datetime.now().isoformat()})
+        # Skip = "don't visit during the firm commit window". Expands to
+        # `commit_days` working days starting from d_str. Without this
+        # expansion the solver would just push the client to day 1 (the
+        # day after) — defeating the operator's intent.
+        try:
+            start = date.fromisoformat(d_str)
+        except Exception:
+            return jsonify({'ok': False, 'error': 'bad date'}), 400
+        commit_dates = _upcoming_workdays(start, count=2)
+        forbids.append({
+            'client_id': cid,
+            'dates': [d.isoformat() for d in commit_dates],
+            'reason': 'dashboard skip (commit window)',
+            'created_at': datetime.now().isoformat(),
+        })
     save_user_overrides(USER_OVERRIDES, pins, forbids)
     return jsonify({'ok': True, 'pins': pins, 'forbids': forbids})
 

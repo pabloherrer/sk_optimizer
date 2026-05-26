@@ -441,8 +441,8 @@ function overrideButtonsHTML(r, planDate, dateLabel) {
   if (r.forbidden) {
     return `
       <div class="override-cell">
-        <span class="override-state skipped" title="Will not be visited on ${dateLabel}. Click × to clear.">
-          ✗ Skipping ${escape(dateLabel)}
+        <span class="override-state skipped" title="Will not be visited during the commit window (typically tomorrow + day-after). Click × to clear.">
+          ✗ Skip commit window
         </span>
         <button class="btn-mini clear"
                 onclick="doOverride('${escape(r.id)}','clear','')"
@@ -458,7 +458,7 @@ function overrideButtonsHTML(r, planDate, dateLabel) {
       </button>
       <button class="btn-action skip"
               onclick="doOverride('${escape(r.id)}','skip','${planDate}')"
-              title="Tell the optimizer NOT to visit this client on ${dateLabel}">
+              title="Tell the optimizer NOT to visit this client during the commit window (tomorrow + day-after).">
         ✗ Skip
       </button>
     </div>`;

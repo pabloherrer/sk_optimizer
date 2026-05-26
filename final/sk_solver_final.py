@@ -846,8 +846,20 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
     # dry AND the only allowed days are forbidden), warn loudly. Without
     # this log line the client would silently end up deferred via the
     # disjunction's drop penalty, with no clear "why."
-    DRY_DAY_GRACE = 1
+    # DRY_DAY_GRACE: how many full days of being dry the model tolerates.
+    #
+    # For clients with days_supply > 0.5 we accept a 1-day grace (the truck
+    # arrives the morning after they go dry — minor).
+    #
+    # For clients already EMPTY (days_supply ≤ 0.5) we tighten to 0 — they
+    # MUST be served on day 0 (today's plan-as-of date). Without this tighter
+    # rule the solver was scheduling already-empty clients (ATL MESA, JC FOOD
+    # TRADING, etc.) 6-9 days out because their stop fit geographically into
+    # a later truck day, ignoring the urgency.
+    GRACE_NORMAL = 1
+    GRACE_EMPTY  = 0
     unschedulable_urgent: List[str] = []
+    n_locked_to_day_0_today = 0
     for i, c in enumerate(pool):
         node_idx = manager.NodeToIndex(i + 1)
         ts = problem.initial_tanks[c.id]
@@ -855,7 +867,8 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
         if rate <= 0:
             continue
         days_supply = float(ts.current_lbs) / rate
-        max_cal_days_allowed = days_supply + DRY_DAY_GRACE
+        grace = GRACE_EMPTY if days_supply <= 0.5 else GRACE_NORMAL
+        max_cal_days_allowed = days_supply + grace
         n_kept = 0
         for v in range(n_vehicles):
             _, day_idx = v2td(v)
@@ -864,12 +877,16 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
                 except Exception: pass
             else:
                 n_kept += 1
+        if grace == GRACE_EMPTY and n_kept > 0:
+            n_locked_to_day_0_today += 1
         # If we just blew away every vehicle for a low-supply client, the
         # solver will be forced to drop them — log so the operator sees it.
         if n_kept == 0 and days_supply < 5:
             unschedulable_urgent.append(
                 f"{c.id} ({c.customer[:30]}, days_supply={days_supply:.1f})"
             )
+    if n_locked_to_day_0_today:
+        print(f"  Already-empty clients locked to day 0: {n_locked_to_day_0_today}")
     if unschedulable_urgent:
         print(f"  ⚠ {len(unschedulable_urgent)} urgent client(s) have NO feasible "
               f"day in horizon — will be deferred. Investigate:")
