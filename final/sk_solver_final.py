@@ -103,6 +103,20 @@ STOCKOUT_COST_PER_LB_DAY   = 10.00      # $/lb-day
 # $1.50 → solver accepts top-offs within ~3 miles of being on the way.
 SMALL_STOP_FEE             = 1.50       # $ extra cost per visit when refill < min_stop_lbs
 
+# Minimum fill % rule (RC-9, operator-requested).
+# Don't dispatch a truck to deliver less than X% of tank capacity — too
+# inefficient. A 1000-lb tank getting 400 lbs (40% fill) gets skipped;
+# a 500-lb tank getting 400 lbs (80% fill) gets served.
+#
+# Urgency exception: clients with DTE ≤ 3 days bypass this rule — better
+# to deliver a small amount than let a customer stock out.
+#
+# Set MIN_FILL_PCT = 0.0 to disable.
+MIN_FILL_PCT               = 0.50       # min refill / tank capacity for non-urgent stops
+# NOTE: at runtime this default is overridden by `solver_settings.min_fill_pct`
+# in local_config.json (set from the dashboard's Solver Tuning card). The
+# constant here is the fallback when no override exists.
+
 # Drop-penalty tiers ($ — see compute_drop_penalty for the urgency logic).
 # Sensitivity tested in validate.py; values bracketed by:
 #   - Lower: don't drop a client whose next-target visit is within the horizon
@@ -862,15 +876,18 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
         for cid in unschedulable_urgent[:10]:
             print(f"    - {cid}")
 
-    # (b), (c), (d) — refill-driven forbids
+    # (b), (c), (d), (f) — refill-driven forbids
+    n_min_fill_blocked = 0
     for i, c in enumerate(pool):
         node_idx = manager.NodeToIndex(i + 1)
         ts = problem.initial_tanks[c.id]
         rate = float(ts.rate_lbs_per_day or 0.0)
         is_zero_rate = rate <= 0
-        # Urgency on day 0 (today): used to allow tiny refills for
+        tank_cap = float(c.tank_capacity_lbs)
+        # Urgency on day 0 (today): used to allow small refills for
         # critical clients we can't afford to skip.
         dte_today = (float(ts.current_lbs) / rate) if rate > 0 else 999.0
+        min_fill_threshold = int(round(MIN_FILL_PCT * tank_cap))
         for v in range(n_vehicles):
             _, day_idx = v2td(v)
             refill = refills_by_day[day_idx][i + 1]
@@ -884,12 +901,27 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
                 try: routing.VehicleVar(node_idx).RemoveValue(v)
                 except Exception: pass
                 continue
-            # (c): refill below hard-floor AND client not urgent today
-            # (urgent clients can have small refills — we MUST serve them
-            # even with tiny top-offs; the invariant honors this exception).
+            # (c): refill below absolute hard-floor (50 lb) AND client
+            # not urgent today. Urgent clients can have small refills —
+            # we MUST serve them even with tiny top-offs.
             if refill < HARD_FLOOR_LBS and dte_today > 3.0:
                 try: routing.VehicleVar(node_idx).RemoveValue(v)
                 except Exception: pass
+                continue
+            # (f) NEW: refill below MIN_FILL_PCT of tank AND not urgent
+            # (operator request: don't waste a stop on a tank with too
+            # much headroom — let it drain a few more days first).
+            if (MIN_FILL_PCT > 0
+                    and refill < min_fill_threshold
+                    and dte_today > 3.0):
+                try: routing.VehicleVar(node_idx).RemoveValue(v)
+                except Exception: pass
+                n_min_fill_blocked += 1
+    if n_min_fill_blocked:
+        # n_min_fill_blocked counts (client × day) pairs, not unique clients.
+        print(f"  Min-fill rule (≥ {int(MIN_FILL_PCT*100)}% of tank): "
+              f"blocked {n_min_fill_blocked} (client × day) pairs from being "
+              f"a small top-off")
 
     # ── 5.12 Commit-window enforcement (RC-7) ────────────────────────────
     # Lock clients with DTE ≤ commit_days+buffer into days 0..commit_days-1
@@ -1068,14 +1100,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Input file: arg → local_config.json → fallback
+    # Also pick up `solver_settings` from local_config.json (dashboard-editable).
     input_file = args.input_file
-    if input_file is None:
-        local_cfg = repo / 'local_config.json'
-        if local_cfg.exists():
-            import json
-            cfg_path = json.loads(local_cfg.read_text(encoding='utf-8')).get('input_file')
-            if cfg_path:
-                input_file = Path(cfg_path)
+    local_cfg_path = repo / 'local_config.json'
+    if local_cfg_path.exists():
+        import json as _json
+        try:
+            local_cfg = _json.loads(local_cfg_path.read_text(encoding='utf-8'))
+        except Exception:
+            local_cfg = {}
+        if input_file is None and local_cfg.get('input_file'):
+            input_file = Path(local_cfg['input_file'])
+        # Apply runtime overrides from solver_settings
+        settings = local_cfg.get('solver_settings') or {}
+        if 'min_fill_pct' in settings:
+            try:
+                v = float(settings['min_fill_pct'])
+                if 0.0 <= v <= 0.95:
+                    global MIN_FILL_PCT
+                    MIN_FILL_PCT = v
+            except Exception:
+                pass
     if input_file is None or not input_file.exists():
         print(f"ERROR: input file not found ({input_file})")
         return 2
@@ -1119,6 +1164,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    ot_premium_per_min     = ${COST_PER_MINUTE_OT_PREMIUM}/min over target")
     print(f"    truck_dispatch_cost    = ${TRUCK_DISPATCH_COST}/day        (warm-up in fuel)")
     print(f"    small_stop_fee         = ${SMALL_STOP_FEE}/stop  (refill < {problem.min_stop_lbs} lbs)")
+    print(f"    min_fill_pct           = {int(MIN_FILL_PCT*100)}%  (skip non-urgent stops below this fill %)")
     print(f"    drop_penalty tiers     = HARD ${DROP_PENALTY_HARD}, HIGH ${DROP_PENALTY_HIGH}, "
           f"MED ${DROP_PENALTY_MED}, LOW ${DROP_PENALTY_LOW}")
 

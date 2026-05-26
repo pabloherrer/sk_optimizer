@@ -201,7 +201,8 @@ body {
 }
 
 .card-clients { min-height: 0; }
-.card-trucks  { flex: 0 0 auto; max-height: 40%; }
+.card-trucks  { flex: 0 0 auto; max-height: 36%; }
+.card-tuning  { flex: 0 0 auto; }
 .card-plan    { flex: 1; min-height: 0; }
 
 .card-header {
@@ -219,6 +220,41 @@ body {
 .card-body { flex: 1; padding: 12px 16px; overflow: auto; min-height: 0; }
 .card-body-clients { padding: 0; }
 .card-body-trucks { padding: 8px 12px; }
+.card-body-tuning { padding: 10px 14px; }
+
+/* Solver Tuning card */
+.tuning-row { display: flex; flex-direction: column; gap: 6px; }
+.tuning-row label {
+  font-size: 11px; font-weight: 600; color: var(--text);
+  letter-spacing: 0.03em; text-transform: uppercase;
+  display: flex; align-items: center; gap: 6px;
+}
+.tuning-help {
+  color: var(--text-faint); font-size: 13px;
+  cursor: help; user-select: none;
+  font-weight: 400; text-transform: none;
+}
+.tuning-control {
+  display: flex; align-items: center; gap: 10px;
+}
+.tuning-control input[type="range"] {
+  flex: 1;
+  accent-color: var(--sk-green);
+  cursor: pointer;
+}
+.tuning-value {
+  font-size: 14px; font-weight: 700;
+  color: var(--sk-green-dark);
+  font-variant-numeric: tabular-nums;
+  min-width: 42px; text-align: right;
+}
+.tuning-hint {
+  font-size: 11px; color: var(--text-faint);
+  min-height: 14px;
+}
+.tuning-hint.saving { color: var(--sk-gold-dark); }
+.tuning-hint.saved  { color: var(--success); }
+.tuning-hint.error  { color: var(--danger); }
 
 .loading, .empty {
   color: var(--text-faint); font-size: 13px; font-style: italic;

@@ -131,6 +131,28 @@
       </div>
     </section>
 
+    <!-- Solver Tuning — min fill %, etc. -->
+    <section class="card card-tuning">
+      <header class="card-header">
+        <h2>Solver Tuning</h2>
+        <span class="card-hint">Takes effect on next Run</span>
+      </header>
+      <div class="card-body card-body-tuning">
+        <div class="tuning-row">
+          <label for="min-fill-pct">
+            Minimum fill %
+            <span class="tuning-help"
+                  title="Skip a stop if the planned delivery would be less than this % of tank capacity. A 1000-lb tank getting a 400-lb top-off (40%) would be skipped at 50%, but kept at 30%. Urgent clients (DTE ≤ 3 days) bypass this rule.">ⓘ</span>
+          </label>
+          <div class="tuning-control">
+            <input type="range" id="min-fill-pct" min="0" max="80" step="5">
+            <span class="tuning-value" id="min-fill-pct-val">—</span>
+          </div>
+          <div class="tuning-hint" id="min-fill-pct-hint"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- Last Plan (KPIs + downloads + day breakdown) -->
     <section class="card card-plan">
       <header class="card-header">

@@ -416,6 +416,62 @@ def api_settings():
     return jsonify({'ok': True, 'input_file': str(p)})
 
 
+# ── Solver tuning settings (min_fill_pct etc.) ─────────────────────────────
+# Persisted to local_config.json under `solver_settings`, picked up by
+# sk_solver_final.py at every run. Defaults match the in-code constants.
+_SOLVER_DEFAULTS = {
+    'min_fill_pct': 0.50,
+}
+
+
+def _read_solver_settings() -> Dict:
+    if not LOCAL_CONFIG.exists():
+        return dict(_SOLVER_DEFAULTS)
+    try:
+        cfg = json.loads(LOCAL_CONFIG.read_text(encoding='utf-8'))
+    except Exception:
+        return dict(_SOLVER_DEFAULTS)
+    user_settings = cfg.get('solver_settings') or {}
+    out = dict(_SOLVER_DEFAULTS)
+    out.update({k: v for k, v in user_settings.items() if k in _SOLVER_DEFAULTS})
+    return out
+
+
+def _write_solver_settings(updates: Dict) -> Dict:
+    cfg = {}
+    if LOCAL_CONFIG.exists():
+        try:
+            cfg = json.loads(LOCAL_CONFIG.read_text(encoding='utf-8'))
+        except Exception:
+            cfg = {}
+    cur = cfg.get('solver_settings') or {}
+    cur.update(updates)
+    cfg['solver_settings'] = cur
+    LOCAL_CONFIG.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+    return _read_solver_settings()
+
+
+@app.route('/api/settings/solver', methods=['GET', 'POST'])
+def api_settings_solver():
+    if request.method == 'GET':
+        return jsonify(_read_solver_settings())
+    body = request.get_json(force=True) or {}
+    updates: Dict = {}
+    # Validate each field with its own bounds
+    if 'min_fill_pct' in body:
+        try:
+            v = float(body['min_fill_pct'])
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'min_fill_pct must be a number'}), 400
+        if not (0.0 <= v <= 0.95):
+            return jsonify({'ok': False, 'error': 'min_fill_pct must be between 0 and 0.95'}), 400
+        updates['min_fill_pct'] = v
+    if not updates:
+        return jsonify({'ok': False, 'error': 'no recognized settings provided'}), 400
+    new_state = _write_solver_settings(updates)
+    return jsonify({'ok': True, **new_state})
+
+
 @app.route('/api/pick-file', methods=['POST'])
 def api_pick_file():
     """Open native OS file picker. Returns selected path."""

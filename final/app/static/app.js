@@ -24,6 +24,10 @@ window.addEventListener('DOMContentLoaded', () => {
     renderClients();
     refreshTrucks();
   });
+  // Solver Tuning — min-fill-pct slider
+  const slider = $('#min-fill-pct');
+  slider.addEventListener('input', onMinFillSliderInput);
+  slider.addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
   refreshAll();
 });
 
@@ -33,7 +37,60 @@ async function refreshAll() {
     refreshLastPlan(),
     refreshClients(),
     refreshTrucks(),
+    refreshSolverSettings(),
   ]);
+}
+
+// ── Solver Tuning ─────────────────────────────────────────────────────────
+async function refreshSolverSettings() {
+  try {
+    const r = await fetch('/api/settings/solver');
+    const s = await r.json();
+    const pct = Math.round((s.min_fill_pct ?? 0.5) * 100);
+    $('#min-fill-pct').value = pct;
+    $('#min-fill-pct-val').textContent = pct + '%';
+    setMinFillHint('');
+  } catch (e) {
+    setMinFillHint('Could not load: ' + e, 'error');
+  }
+}
+
+function onMinFillSliderInput() {
+  // Live update of the displayed value as the user drags
+  const pct = parseInt($('#min-fill-pct').value, 10);
+  $('#min-fill-pct-val').textContent = pct + '%';
+  setMinFillHint(describeMinFill(pct), '');
+}
+
+async function onMinFillSliderCommit() {
+  const pct = parseInt($('#min-fill-pct').value, 10);
+  setMinFillHint('Saving…', 'saving');
+  try {
+    const r = await fetch('/api/settings/solver', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ min_fill_pct: pct / 100 }),
+    });
+    const res = await r.json();
+    if (!res.ok) { setMinFillHint(res.error || 'Save failed', 'error'); return; }
+    setMinFillHint('Saved — applies on next Run.', 'saved');
+  } catch (e) {
+    setMinFillHint('Network error: ' + e, 'error');
+  }
+}
+
+function describeMinFill(pct) {
+  if (pct === 0) return 'Disabled — solver may schedule any-size top-off.';
+  if (pct < 30)  return `Permissive — only filters very small top-offs.`;
+  if (pct < 50)  return `Light filter — small top-offs may still be planned.`;
+  if (pct < 65)  return `Standard — skip stops with high tank headroom.`;
+  return `Aggressive — only big refills (urgent clients still served).`;
+}
+
+function setMinFillHint(text, cls) {
+  const el = $('#min-fill-pct-hint');
+  el.textContent = text;
+  el.className = 'tuning-hint' + (cls ? ' ' + cls : '');
 }
 
 // ── Data Strip (top compact stats + file path) ────────────────────────────
