@@ -93,6 +93,32 @@ def _write_input_file(path: Path) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# SAFE CELL PARSING
+# ════════════════════════════════════════════════════════════════════════════
+# Excel cells may contain error strings ("#VALUE!", "#REF!", "#NAME?",
+# "#DIV/0!", "#N/A") when a formula breaks — e.g. while the operator is
+# editing the M6 staleness formula. A raw float() on those crashes the
+# /api/health endpoint with a 500 (which then renders as HTML and the
+# frontend chokes parsing "<!doctype" as JSON). Funnel every cell-to-float
+# through this helper so a bad cell becomes None, not an exception.
+
+def _safe_float(v) -> Optional[float]:
+    if v is None or v == '':
+        return None
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s or s.startswith('#'):  # #VALUE! #REF! #NAME? #DIV/0! #N/A
+        return None
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # DATA FRESHNESS GUARDS
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -177,18 +203,20 @@ def _stale_client_warnings(f: Path) -> List[Dict]:
             name = str(row[2] or '')[:40]
             # Column shifts after Std Dev added at col 9 — everything
             # after col 8 moved +1. AVG (col 8 / idx 7) stayed put.
-            tank = float(row[6]) if row[6] else 0
-            rate = float(row[7]) if row[7] else 0          # AVG rate
-            days_since = row[11] if len(row) > 11 else None
-            est_cur = float(row[12]) if len(row) > 12 and row[12] is not None else None
+            # _safe_float() makes us robust to #VALUE!/#REF! cells.
+            tank = _safe_float(row[6]) or 0
+            rate = _safe_float(row[7]) or 0           # AVG rate
+            days_since_raw = row[11] if len(row) > 11 else None
+            days_since = _safe_float(days_since_raw)
+            est_cur = _safe_float(row[12]) if len(row) > 12 else None
             anova_lvl = row[19] if len(row) > 19 else None
-            anova_age = row[20] if len(row) > 20 else None
+            anova_age = _safe_float(row[20]) if len(row) > 20 else None
             anova_fresh = (anova_lvl is not None and
-                            isinstance(anova_age, (int, float)) and
-                            abs(float(anova_age)) < 48)
+                            anova_age is not None and
+                            abs(anova_age) < 48)
 
             if rate <= 0 or tank <= 0 or est_cur is None: continue
-            if not isinstance(days_since, (int, float)): continue
+            if days_since is None: continue
             if anova_fresh: continue   # Anova overrides any concern
 
             if days_since > 14 and est_cur <= 0.05 * tank:
@@ -263,13 +291,11 @@ def _data_health() -> Dict:
             if cid is None: continue
             total += 1
             lvl = row[4] if len(row) > 4 else None
-            age = row[12] if len(row) > 12 else None
+            age = _safe_float(row[12]) if len(row) > 12 else None
             if lvl is not None and lvl != '':
                 with_reading += 1
-                try:
-                    a = float(age) if age else 999
-                    max_age = max(max_age, a); min_age = min(min_age, a)
-                except Exception: pass
+                a = age if age is not None else 999
+                max_age = max(max_age, a); min_age = min(min_age, a)
         out['anova_total'] = total
         out['anova_with_reading'] = with_reading
         out['anova_pct'] = round(100 * with_reading / max(total, 1), 0)
@@ -351,24 +377,26 @@ def _client_list() -> List[Dict]:
         if not row or row[1] is None:
             continue
         cid = str(row[1])
-        spreadsheet_rate = row[7]               # AVG (was "Last", now "AVG")
-        spreadsheet_std = row[8] if len(row) > 8 else None
+        # Use _safe_float so #VALUE!/#REF! cells degrade to None instead of crashing.
+        spreadsheet_rate = _safe_float(row[7])               # AVG
+        spreadsheet_std = _safe_float(row[8]) if len(row) > 8 else None
         last_deliv = row[10] if len(row) > 10 else None
-        est_cur = (row[12] if len(row) > 12 else None) or 0
+        est_cur = _safe_float(row[12]) if len(row) > 12 else None
         anova_lvl = row[19] if len(row) > 19 else None
-        anova_age = row[20] if len(row) > 20 else None
+        anova_age = _safe_float(row[20]) if len(row) > 20 else None
 
         # Use the spreadsheet's AVG rate (which the solver also uses now).
         # No more IQR-filtered fallback — operator-curated AVG is canonical.
-        rate = round(float(spreadsheet_rate), 1) if spreadsheet_rate else None
-        std = round(float(spreadsheet_std), 1) if spreadsheet_std else None
+        rate = round(spreadsheet_rate, 1) if spreadsheet_rate else None
+        std = round(spreadsheet_std, 1) if spreadsheet_std else None
 
         # Tank from clients tuple (master), fallback to Optimizer_Input
         client = by_id.get(cid)
-        tank = float(client.tank_capacity_lbs) if client else float(row[6] or 0)
+        tank_raw = _safe_float(row[6]) or 0
+        tank = float(client.tank_capacity_lbs) if client else tank_raw
         name = client.customer if client else (row[2] or '')
 
-        current_lbs = float(est_cur) if est_cur else 0
+        current_lbs = est_cur or 0.0
         pct = round(100 * current_lbs / tank, 0) if tank > 0 else 0
 
         # DTE = current / rate. Spreadsheet's DTE column (now col 15 / idx 14)
@@ -376,8 +404,8 @@ def _client_list() -> List[Dict]:
         if rate and rate > 0:
             dte = round(current_lbs / rate, 1)
         else:
-            sheet_dte = row[14] if len(row) > 14 else None
-            dte = round(float(sheet_dte), 1) if isinstance(sheet_dte, (int, float)) else None
+            sheet_dte = _safe_float(row[14]) if len(row) > 14 else None
+            dte = round(sheet_dte, 1) if sheet_dte is not None else None
 
         rows.append({
             'id': cid,
@@ -390,7 +418,7 @@ def _client_list() -> List[Dict]:
             'dte': dte,
             'last_delivery': str(last_deliv)[:10] if last_deliv else None,
             'has_anova': anova_lvl is not None,
-            'anova_age_h': round(float(anova_age), 1) if isinstance(anova_age, (int, float)) else None,
+            'anova_age_h': round(anova_age, 1) if anova_age is not None else None,
             'dns': cid in dns_flagged,
             'dns_reason': dns_flagged.get(cid, ''),
         })
@@ -539,7 +567,13 @@ def index():
 
 @app.route('/api/health')
 def api_health():
-    return jsonify(_data_health())
+    # Wrap in a try/except so any unexpected error still returns JSON.
+    # The frontend parses this response with r.json(); an HTML 500 page
+    # would throw "Unexpected token '<'" and the strip would show nothing.
+    try:
+        return jsonify(_data_health())
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'health check failed: {e}'}), 200
 
 
 @app.route('/api/settings', methods=['GET', 'POST'])
