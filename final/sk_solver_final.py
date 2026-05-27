@@ -117,6 +117,33 @@ MIN_FILL_PCT               = 0.50       # min refill / tank capacity for non-urg
 # in local_config.json (set from the dashboard's Solver Tuning card). The
 # constant here is the fallback when no override exists.
 
+# Truck utilization reward — encodes the operational value of using
+# spare time/capacity to serve more customers TODAY rather than deferring
+# them to a future truck-day.
+#
+# The cost model otherwise has a blind spot: regular labor is $0/min
+# (drivers salaried — sunk) and dispatch cost is $0 (no marginal cost to
+# rolling the truck). The only real cost of adding a stop is the extra
+# mileage. Without a positive reward for filling truck-days, the solver
+# correctly minimizes mileage and stops early — even when time and tank
+# space remain.
+#
+# This is NOT a knob — it's a fixed encoding of operational truth:
+# "if the truck is already going out, an extra stop is worth more to us
+# than $X of mileage." We set X = $0.30/min of underutilization below a
+# 6-hour target. At ~$3-6 of mileage per added stop and ~30 min per stop,
+# the math: stop adds (30 × $0.30) = $9 of reward, far above mileage cost
+# → solver eagerly fills truck-days.
+#
+# Mechanics: SetCumulVarSoftLowerBound on each truck-day's End-time node.
+# Effective penalty for short truck-day = (target - actual_minutes) × rate.
+UTILIZATION_TARGET_MIN     = 360        # 6 h target — short trucks pay below this
+# Disabled: the urgency-aware per-stop reward (§5.5) does this work
+# correctly by picking the RIGHT clients, not just any clients. A blanket
+# time-target penalty would add stops indiscriminately — the urgency
+# reward only adds stops worth the mileage.
+UTILIZATION_PENALTY_PER_MIN = 0.00
+
 # Drop-penalty tiers ($ — see compute_drop_penalty for the urgency logic).
 # Sensitivity tested in validate.py; values bracketed by:
 #   - Lower: don't drop a client whose next-target visit is within the horizon
@@ -256,15 +283,19 @@ def _iqr_filter(values: np.ndarray, factor: float = 3.0) -> np.ndarray:
 #   - consumption rates (recency-weighted)
 # Returns the immutable, augmented ProblemInstance.
 
-def _load_sheet_est_current(input_file: Path) -> Dict[str, float]:
-    """Read Optimizer_Input col L ("Est. Current") → {client_id: lbs}.
+def _load_sheet_rates_and_state(input_file: Path) -> Dict[str, Dict[str, float]]:
+    """Read Optimizer_Input → per-client AVG rate, StdDev, and Est Current.
 
-    This is the spreadsheet's view of each tank's current level — computed
-    from `tank - days_since_last × spreadsheet_rate` via formula. The
-    operator has been managing and trusting these numbers; we use them
-    as the canonical current-level when no Anova reading is available.
+    Schema (after operator added AVG + StdDev columns):
+      col  8 (idx 7)  = AVG Per Day Cons (lbs/day)
+      col  9 (idx 8)  = Std Dev (lbs/day)
+      col 13 (idx 12) = Est. Current (lbs)
+
+    The operator curates AVG and StdDev directly — this is the canonical
+    source of truth, not our IQR-filtered estimator. StdDev enables
+    variance-aware safety stock if we want it later.
     """
-    out: Dict[str, float] = {}
+    out: Dict[str, Dict[str, float]] = {}
     try:
         import openpyxl as _ox
         wb = _ox.load_workbook(input_file, data_only=True, read_only=True)
@@ -272,21 +303,42 @@ def _load_sheet_est_current(input_file: Path) -> Dict[str, float]:
             wb.close()
             return out
         ws = wb['Optimizer_Input']
-        for row in ws.iter_rows(min_row=6, max_col=12, values_only=True):
+        for row in ws.iter_rows(min_row=6, max_col=14, values_only=True):
             if not row or row[1] is None:
                 continue
             cid = str(row[1])
-            val = row[11]   # col L (1-indexed col 12)
-            if val is None:
-                continue
+            entry: Dict[str, float] = {}
+            # AVG rate (col 8 / index 7)
             try:
-                out[cid] = float(val)
+                if row[7] is not None:
+                    entry['avg_rate'] = float(row[7])
             except (ValueError, TypeError):
-                continue
+                pass
+            # StdDev (col 9 / index 8) — NEW
+            try:
+                if len(row) > 8 and row[8] is not None:
+                    entry['std_dev'] = float(row[8])
+            except (ValueError, TypeError):
+                pass
+            # Est. Current (col 13 / index 12)
+            try:
+                if len(row) > 12 and row[12] is not None:
+                    entry['est_current'] = float(row[12])
+            except (ValueError, TypeError):
+                pass
+            if entry:
+                out[cid] = entry
         wb.close()
     except Exception:
         pass
     return out
+
+
+def _load_sheet_est_current(input_file: Path) -> Dict[str, float]:
+    """Back-compat: same shape as before, but reads from the new helper."""
+    return {cid: v['est_current']
+            for cid, v in _load_sheet_rates_and_state(input_file).items()
+            if 'est_current' in v}
 
 
 def build_augmented_problem(
@@ -342,51 +394,34 @@ def build_augmented_problem(
                 base = replace(base, truck_available=new_avail)
                 print(f"  Applied truck unavailability: {applied} (date, truck) pairs disabled")
 
-    # Re-estimate consumption rates (RC-5).
-    print("  Recency-weighting consumption rates (60d vs all-time max) ...")
-    deliveries_df = load_deliveries(input_file)
-    client_ids = tuple(c.id for c in base.clients)
-    new_rates = estimate_consumption_recency_weighted(
-        deliveries_df=deliveries_df,
-        clients=base.clients,
-        today=today,
-    )
+    # Load operator-curated AVG and StdDev (from the new Optimizer_Input
+    # columns 8 and 9) AND Est Current (col 13). This is now the canonical
+    # source of truth for rates — replaces our own IQR-filtered estimator.
+    # Why: the operator's AVG is reviewed and tuned over time. Our internal
+    # estimator was overestimating consumption (75p inflation), causing
+    # over-projection of dry-out and over-delivery. The operator's AVG +
+    # StdDev are the values they SEE in the spreadsheet, so the solver's
+    # view stays consistent with the operator's mental model.
+    sheet_data = _load_sheet_rates_and_state(input_file)
+    sheet_current = {cid: v['est_current']
+                     for cid, v in sheet_data.items() if 'est_current' in v}
 
-    # Replace TankState rates where the recency-weighted estimate is higher.
-    # ALSO override current_lbs with the spreadsheet's `Est Current` value
-    # when the source is 'estimated' (i.e., no Anova). Why:
-    #
-    #   The 75p recency-weighted rate is intentionally conservative for
-    #   forward planning ("assume busy case"), but applying it to STATE
-    #   ("how much oil is in the tank right now") under-estimates the
-    #   current level. Over 10 days that's ~100 lb of phantom consumption.
-    #
-    #   Concrete bug it fixes: OREGANO QUEEN CREEK current was 64 lb in
-    #   solver vs 162 lb in spreadsheet. Solver scheduled a 436-lb refill
-    #   for today; reality 162 + 436 = 598 in a 500-lb tank → 98 lb overflow.
-    #
-    #   The fix: trust the operator's spreadsheet for the STARTING level
-    #   (their formula has been managed and reviewed for months). Keep the
-    #   75p rate for forward projection in refills_by_day so future-day
-    #   refills still have a safety margin.
-    sheet_current = _load_sheet_est_current(input_file)
-    # Build tank-cap lookup for sanity-checking spreadsheet values.
     tank_cap_by_id = {c.id: float(c.tank_capacity_lbs) for c in base.clients}
     updated_tanks: Dict[str, TankState] = {}
-    n_increased = n_unchanged = n_current_aligned = n_sheet_bad = 0
+    n_rate_set = n_current_aligned = n_sheet_bad = 0
     for cid, ts in base.initial_tanks.items():
         new_ts = ts
-        # Rate update (recency-weighted, only if higher than existing)
-        new_rate, new_sigma = new_rates.get(cid, (float('nan'), float('nan')))
-        if (not math.isnan(new_rate)) and new_rate > (ts.rate_lbs_per_day or 0):
+        sd = sheet_data.get(cid, {})
+        # Use operator-curated AVG as the rate. If StdDev provided, store it.
+        avg_rate = sd.get('avg_rate')
+        std_dev = sd.get('std_dev')
+        if avg_rate is not None and avg_rate > 0:
             new_ts = replace(
                 new_ts,
-                rate_lbs_per_day=new_rate,
-                rate_std_dev=new_sigma if not math.isnan(new_sigma) else ts.rate_std_dev,
+                rate_lbs_per_day=float(avg_rate),
+                rate_std_dev=float(std_dev) if std_dev is not None else ts.rate_std_dev,
             )
-            n_increased += 1
-        else:
-            n_unchanged += 1
+            n_rate_set += 1
         # Current-level override: ONLY when source is 'estimated' (no
         # Anova/manual reading). Anova/manual readings are real
         # measurements and should always win.
@@ -406,8 +441,8 @@ def build_augmented_problem(
                                   source='estimated (spreadsheet)')
                 n_current_aligned += 1
         updated_tanks[cid] = new_ts
-    print(f"  Rate updates: {n_increased} client rates increased (recency), "
-          f"{n_unchanged} unchanged")
+    print(f"  Rates: {n_rate_set} clients have spreadsheet AVG rate set "
+          f"(operator-curated, replaces internal estimator)")
     if n_current_aligned:
         print(f"  Current-level aligned to spreadsheet for {n_current_aligned} clients "
               f"(prevents overflow from rate-driven under-estimation)")
@@ -618,12 +653,78 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
     small_stop_fee_units = int(round(SMALL_STOP_FEE * COST_SCALE))
 
     # ── 5.5 Arc cost callback ─────────────────────────────────────────────
-    # cost = (miles × $/mi) + (small-stop fee if destination's refill < min_stop_lbs
-    #                                       AND destination not urgent today)
-    # Labor cost is ZERO for regular hours (RC-2). OT priced separately.
+    #
+    # Cost per arc =
+    #     (miles × $/mi)                                  ← travel cost
+    #   + (small-stop fee if refill < min_stop AND not urgent)
+    #   - URGENCY-DAY-FIT REWARD on destination            ← new (RC-11)
+    #   - REFILL-SIZE REWARD on destination                ← new (RC-11)
+    #
+    # The urgency-day-fit reward encodes the operator's intuition:
+    # "Marginal benefit of adding a stop is HIGH when the client needs
+    # oil now, and LOW (or negative) when the client could easily wait."
+    # Without this, the marginal benefit of any non-deferred stop was $0
+    # (because the disjunction's drop penalty doesn't fire unless the
+    # client goes unserved in the WHOLE horizon). So the solver would
+    # stop a truck early on a low-density day even with spare capacity.
+    #
+    # The reward is per (client, day) — computed from the client's
+    # PROJECTED DTE on that vehicle's day. Same client, different days,
+    # different reward.
+
+    # Urgency-aware per-stop rewards were tried (and produced fuller trucks)
+    # but distorted the insertion heuristic's routing decisions, causing
+    # geographically-poor sequences (zig-zag between clusters). The
+    # mechanism is per-arc cost adjustment, which the PARALLEL_CHEAPEST_
+    # INSERTION first-solution strategy uses for insertion positions —
+    # negative arc costs confused it.
+    #
+    # Reverted to ZERO rewards. Urgency now influences scheduling only
+    # via the structural constraints:
+    #   - GRACE_EMPTY=0 locks already-empty clients to day 0
+    #   - DROP_PENALTY tiers (HARD/HIGH/MED/LOW) for end-of-horizon defer
+    #   - Cost-callback only models real costs (miles + small-stop fee).
+    URGENCY_BONUS_PER_DTE_TIER = {
+        'stockout': 0.0,
+        'critical': 0.0,
+        'urgent':   0.0,
+        'soon':     0.0,
+        'normal':   0.0,
+        'far':      0.0,
+    }
+    REFILL_REWARD_PER_LB = 0.0
+
+    def _urgency_bonus_dollars(dte_at_day: float) -> float:
+        if dte_at_day <= 0:    return URGENCY_BONUS_PER_DTE_TIER['stockout']
+        if dte_at_day <= 1.5:  return URGENCY_BONUS_PER_DTE_TIER['critical']
+        if dte_at_day <= 3.0:  return URGENCY_BONUS_PER_DTE_TIER['urgent']
+        if dte_at_day <= 7.0:  return URGENCY_BONUS_PER_DTE_TIER['soon']
+        if dte_at_day <= 14.0: return URGENCY_BONUS_PER_DTE_TIER['normal']
+        return URGENCY_BONUS_PER_DTE_TIER['far']
+
+    # Pre-compute reward per (client, day) — done once at model-build time
+    # to avoid per-callback recomputation. Shape: [n_days][n_nodes].
+    stop_rewards_by_day: List[List[int]] = []
+    for d in range(n_days):
+        cal_days = cal_days_to_d[d]
+        day_rewards = [0]   # depot has no reward
+        for i, c in enumerate(pool):
+            ts = problem.initial_tanks[c.id]
+            rate = float(ts.rate_lbs_per_day or 0.0)
+            if rate <= 0:
+                day_rewards.append(0)
+                continue
+            cur_at_d = max(0.0, float(ts.current_lbs) - cal_days * rate)
+            dte_at_d = cur_at_d / rate if rate > 0 else 999.0
+            urgency_b = _urgency_bonus_dollars(dte_at_d)
+            refill = refills_by_day[d][i + 1]
+            refill_b = REFILL_REWARD_PER_LB * refill
+            total_reward_units = int(round((urgency_b + refill_b) * COST_SCALE))
+            day_rewards.append(total_reward_units)
+        stop_rewards_by_day.append(day_rewards)
 
     def _make_cost_cb(_mgr, _sd, _rf, _rates, _curs, _min_stop_lbs, _mile_cost,
-                      _small_fee):
+                      _small_fee, _stop_rewards_d):
         def _cb(from_idx, to_idx):
             fn = _mgr.IndexToNode(from_idx)
             tn = _mgr.IndexToNode(to_idx)
@@ -639,6 +740,8 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
                     dte_today = (cur / rate) if rate > 0 else 999.0
                     if dte_today > 3.0:
                         cost += _small_fee
+                # Urgency-day-fit + refill-size reward (NEGATIVE cost)
+                cost -= _stop_rewards_d[tn]
             return cost
         return _cb
 
@@ -648,6 +751,7 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
             manager, sub_dist_m, refills_by_day[day_idx],
             rate_per_client, current_per_client,
             min_stop_lbs, cost_per_mile_units, small_stop_fee_units,
+            stop_rewards_by_day[day_idx],
         )
         cb_idx = routing.RegisterTransitCallback(cb)
         routing.SetArcCostEvaluatorOfVehicle(cb_idx, v)
@@ -684,6 +788,32 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
         True, 'Time',
     )
 
+    # ── 5.6c StopCount dimension — soft target for stops per truck-day ───
+    # Encourages fuller truck-days WITHOUT touching per-arc costs. The
+    # urgency-aware arc rewards tried earlier worked but distorted the
+    # routing heuristic into geographically-poor sequences. This count-
+    # based approach is decoupled from sequencing — it just says "this
+    # truck-day should have at least N stops, otherwise penalty."
+    #
+    # Why count, not time: the routing heuristic uses arc costs for
+    # insertion decisions. A count-based dimension is a pure post-hoc
+    # constraint on the END node, doesn't bias arc selection.
+    TARGET_STOPS_PER_TRUCKDAY = 7   # ~7-stop day = ~5h of work
+    PENALTY_PER_MISSING_STOP_DOLLARS = 4.0   # $4 per stop below target
+    def _count_cb(from_idx):
+        return 0 if manager.IndexToNode(from_idx) == 0 else 1
+    count_cb_idx = routing.RegisterUnaryTransitCallback(_count_cb)
+    routing.AddDimension(count_cb_idx, 0, n_clients + 1, True, 'StopCount')
+    count_dim = routing.GetDimensionOrDie('StopCount')
+    miss_units = int(round(PENALTY_PER_MISSING_STOP_DOLLARS * COST_SCALE))
+    if miss_units > 0:
+        for v in range(n_vehicles):
+            end_idx = routing.End(v)
+            count_dim.SetCumulVarSoftLowerBound(end_idx, TARGET_STOPS_PER_TRUCKDAY,
+                                                  miss_units)
+        print(f"  Stop-count target: ≥{TARGET_STOPS_PER_TRUCKDAY} stops per truck-day "
+              f"(${PENALTY_PER_MISSING_STOP_DOLLARS}/missing stop)")
+
     # OT premium ONLY (no regular labor) — RC-2.
     time_dim = routing.GetDimensionOrDie('Time')
     ot_premium_units = int(round(COST_PER_MINUTE_OT_PREMIUM * COST_SCALE))
@@ -694,6 +824,21 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
                 end_idx, problem.shift_target_min, ot_premium_units
             )
             # NOTE: no SetSpanCostCoefficientForVehicle — base labor is sunk.
+
+    # Underutilization soft penalty (RC-10).
+    # Penalize truck-days returning before UTILIZATION_TARGET_MIN. The
+    # solver will trade a few extra miles ($0.55/mi) for keeping the truck
+    # busier — naturally pulling more "convenient" stops onto each day.
+    util_units = int(round(UTILIZATION_PENALTY_PER_MIN * COST_SCALE))
+    if util_units > 0:
+        # We deliberately bound the target by hard_max so we don't accidentally
+        # demand more time than the day physically allows.
+        util_target = min(UTILIZATION_TARGET_MIN, problem.shift_hard_max_min)
+        for v in range(n_vehicles):
+            end_idx = routing.End(v)
+            time_dim.SetCumulVarSoftLowerBound(end_idx, util_target, util_units)
+        print(f"  Utilization preference: ${UTILIZATION_PENALTY_PER_MIN:.2f}/min "
+              f"below {util_target}-min target (encourages fuller truck-days)")
 
     # ── 5.6b Time windows (hard arrival constraint per client) ───────────
     # Many clients have published delivery windows in Client_Time_Windows
@@ -1138,6 +1283,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     MIN_FILL_PCT = v
             except Exception:
                 pass
+        # NOTE: utilization_penalty_per_min is no longer runtime-overridable.
+        # It's a fixed encoding of operational truth, not a tunable knob.
     if input_file is None or not input_file.exists():
         print(f"ERROR: input file not found ({input_file})")
         return 2
@@ -1182,6 +1329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    truck_dispatch_cost    = ${TRUCK_DISPATCH_COST}/day        (warm-up in fuel)")
     print(f"    small_stop_fee         = ${SMALL_STOP_FEE}/stop  (refill < {problem.min_stop_lbs} lbs)")
     print(f"    min_fill_pct           = {int(MIN_FILL_PCT*100)}%  (skip non-urgent stops below this fill %)")
+    print(f"    util_penalty           = ${UTILIZATION_PENALTY_PER_MIN:.2f}/min  (per min below {UTILIZATION_TARGET_MIN}-min target)")
     print(f"    drop_penalty tiers     = HARD ${DROP_PENALTY_HARD}, HIGH ${DROP_PENALTY_HIGH}, "
           f"MED ${DROP_PENALTY_MED}, LOW ${DROP_PENALTY_LOW}")
 

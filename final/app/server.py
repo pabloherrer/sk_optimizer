@@ -93,6 +93,128 @@ def _write_input_file(path: Path) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# DATA FRESHNESS GUARDS
+# ════════════════════════════════════════════════════════════════════════════
+
+def _data_freshness_warnings(f: Path) -> List[Dict]:
+    """Return a list of structured warnings about data freshness/integrity.
+
+    Each warning is {severity, code, message}. Severity is one of:
+      'block'  — solver should refuse to run
+      'warn'   — display prominently, allow override
+      'info'   — informational only
+
+    Checks:
+      1. Excel lock file (~$filename.xlsx) exists → file being edited NOW.
+         Reading it WILL produce inconsistent data because Excel's in-memory
+         state is not on disk. SOLVER MUST NOT RUN.
+      2. File mtime ≥ 24h ago → operator may have forgotten to save or sync.
+         Could be stale. Warn loudly.
+      3. File mtime < 60 seconds ago → was just saved; may be mid-sync.
+         Brief info hint.
+    """
+    warnings: List[Dict] = []
+    if f is None or not f.exists():
+        return warnings
+
+    # 1) Excel lock file — definitive "file is open and being edited"
+    lockfile = f.parent / f'~${f.name}'
+    if lockfile.exists():
+        warnings.append({
+            'severity': 'block',
+            'code': 'EXCEL_LOCK',
+            'message': (f'Excel has the file open with unsaved changes '
+                        f'({lockfile.name}). Save in Excel (Cmd-S) and wait for '
+                        f'OneDrive to sync (✓ icon in menu bar) before running.'),
+        })
+
+    # 2) File age
+    age_hours = (datetime.now() - datetime.fromtimestamp(f.stat().st_mtime)).total_seconds() / 3600.0
+    if age_hours > 24:
+        sev = 'warn' if age_hours < 72 else 'block'
+        warnings.append({
+            'severity': sev,
+            'code': 'STALE_FILE',
+            'message': (f'Data file was last saved {age_hours/24:.1f} days ago. '
+                        f'Anova readings and delivery logs may be outdated. '
+                        f'Open in Excel, check for unsaved edits, and Save.'),
+        })
+    elif age_hours < 0.017:   # < 1 minute
+        warnings.append({
+            'severity': 'info',
+            'code': 'JUST_SAVED',
+            'message': 'File just saved — give OneDrive a moment to fully sync before running.',
+        })
+    return warnings
+
+
+def _stale_client_warnings(f: Path) -> List[Dict]:
+    """Find clients whose delivery log looks incomplete — risky to use them
+    in scheduling because the est_current may be wildly wrong.
+
+    A delivery missing from the log → spreadsheet thinks customer was last
+    served weeks ago → formula clamps current_lbs to 0 → solver schedules
+    a full-tank refill → driver arrives with way too much oil → overflow.
+
+    Heuristic: client has active rate (>0) AND est_current ≤ 5% of tank AND
+    days_since_last > 14 AND has no fresh Anova reading. These are the
+    "likely missing delivery" candidates.
+    """
+    warnings: List[Dict] = []
+    try:
+        wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
+    except Exception:
+        return warnings
+
+    flagged: List[Tuple[str, str, int, int]] = []
+    if 'Optimizer_Input' in wb.sheetnames:
+        ws = wb['Optimizer_Input']
+        # Cols: 2=id 3=name 7=tank 8=rate 11=days_since 12=est_current
+        #       19=anova_lvl 20=anova_age
+        for row in ws.iter_rows(min_row=6, max_col=20, values_only=True):
+            if not row or row[1] is None: continue
+            cid = str(row[1])
+            name = str(row[2] or '')[:40]
+            # Column shifts after Std Dev added at col 9 — everything
+            # after col 8 moved +1. AVG (col 8 / idx 7) stayed put.
+            tank = float(row[6]) if row[6] else 0
+            rate = float(row[7]) if row[7] else 0          # AVG rate
+            days_since = row[11] if len(row) > 11 else None
+            est_cur = float(row[12]) if len(row) > 12 and row[12] is not None else None
+            anova_lvl = row[19] if len(row) > 19 else None
+            anova_age = row[20] if len(row) > 20 else None
+            anova_fresh = (anova_lvl is not None and
+                            isinstance(anova_age, (int, float)) and
+                            abs(float(anova_age)) < 48)
+
+            if rate <= 0 or tank <= 0 or est_cur is None: continue
+            if not isinstance(days_since, (int, float)): continue
+            if anova_fresh: continue   # Anova overrides any concern
+
+            if days_since > 14 and est_cur <= 0.05 * tank:
+                flagged.append((cid, name, int(days_since), int(est_cur)))
+    wb.close()
+
+    if flagged:
+        flagged.sort(key=lambda x: -x[2])  # most-days-stale first
+        sample = ', '.join(f'{c[0]}({c[2]}d)' for c in flagged[:6])
+        more = f' (+{len(flagged)-6} more)' if len(flagged) > 6 else ''
+        warnings.append({
+            'severity': 'warn',
+            'code': 'STALE_CLIENTS',
+            'count': len(flagged),
+            'sample': flagged[:10],
+            'message': (
+                f'{len(flagged)} client(s) show as nearly empty with last delivery '
+                f'>14 days ago and no Anova sensor. The estimate may be wrong '
+                f'(missing delivery in log). Verify before dispatching. '
+                f'Sample: {sample}{more}'
+            ),
+        })
+    return warnings
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # DATA HEALTH
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -168,6 +290,12 @@ def _data_health() -> Dict:
         out['client_dns'] = n_dns
 
     wb.close()
+
+    # Attach freshness warnings (blocks Run when severe).
+    warnings = _data_freshness_warnings(f)
+    warnings.extend(_stale_client_warnings(f))
+    out['warnings'] = warnings
+    out['has_block'] = any(w['severity'] == 'block' for w in warnings)
     return out
 
 
@@ -181,21 +309,16 @@ def _client_list() -> List[Dict]:
     if f is None:
         return []
 
-    # Read solver-correct rates (filters out IQR outliers like the
-    # OREGANO-CHANDLER 2-deliveries-1-day-apart 400 lpd glitch).
+    # Rates come from the spreadsheet's AVG column directly — same as the
+    # solver uses. No need for our own recency estimator anymore (operator
+    # curates AVG + StdDev in the workbook).
     try:
         clients = load_clients(f)
-        deliveries_df = load_deliveries(f)
-        solver_rates = estimate_consumption_recency_weighted(
-            deliveries_df=deliveries_df,
-            clients=clients,
-            today=date.today(),
-        )
     except Exception as e:
-        print(f"WARN: could not compute solver rates: {e}")
-        solver_rates = {}
+        print(f"WARN: could not load clients: {e}")
+        clients = ()
 
-    # Read Optimizer_Input for the rest of the state (current_lbs, last delivery, etc.)
+    # Read Optimizer_Input for state (current_lbs, last delivery, rate, std).
     try:
         wb = openpyxl.load_workbook(f, data_only=True, read_only=True)
     except Exception:
@@ -204,24 +327,41 @@ def _client_list() -> List[Dict]:
     # Build id → Client lookup for tank cap
     by_id = {c.id: c for c in clients}
 
+    # DNS flag lives in Client_List col Q (17) — read once, pass through.
+    dns_flagged: Dict[str, str] = {}   # cid → reason text (if any)
+    if 'Client_List' in wb.sheetnames:
+        cl = wb['Client_List']
+        for crow in cl.iter_rows(min_row=4, max_col=17, values_only=True):
+            if not crow or crow[0] is None: continue
+            dns_val = crow[16] if len(crow) > 16 else None
+            if str(dns_val or '').strip().upper() in ('Y', 'YES', 'TRUE', '1'):
+                notes = crow[15] if len(crow) > 15 else None
+                dns_flagged[str(crow[0])] = str(notes or 'Do not schedule')
+
     rows: List[Dict] = []
     ws = wb['Optimizer_Input']
-    for row in ws.iter_rows(min_row=6, max_col=20, values_only=True):
+    # Column layout (operator added StdDev at col 9, shifted others +1):
+    #   col  8 / idx 7  = AVG rate
+    #   col  9 / idx 8  = Std Dev (new)
+    #   col 11 / idx 10 = Last Delivery
+    #   col 13 / idx 12 = Est. Current
+    #   col 20 / idx 19 = Anova Level
+    #   col 21 / idx 20 = Anova Age
+    for row in ws.iter_rows(min_row=6, max_col=22, values_only=True):
         if not row or row[1] is None:
             continue
         cid = str(row[1])
-        spreadsheet_rate = row[7]
-        last_deliv = row[9]
-        est_cur = row[11] or 0
-        anova_lvl = row[18] if len(row) > 18 else None
-        anova_age = row[19] if len(row) > 19 else None
+        spreadsheet_rate = row[7]               # AVG (was "Last", now "AVG")
+        spreadsheet_std = row[8] if len(row) > 8 else None
+        last_deliv = row[10] if len(row) > 10 else None
+        est_cur = (row[12] if len(row) > 12 else None) or 0
+        anova_lvl = row[19] if len(row) > 19 else None
+        anova_age = row[20] if len(row) > 20 else None
 
-        # Solver-correct rate (or None if unavailable)
-        solver_rate, _ = solver_rates.get(cid, (float('nan'), float('nan')))
-        if solver_rate != solver_rate:  # NaN
-            solver_rate = None
-        else:
-            solver_rate = round(float(solver_rate), 1)
+        # Use the spreadsheet's AVG rate (which the solver also uses now).
+        # No more IQR-filtered fallback — operator-curated AVG is canonical.
+        rate = round(float(spreadsheet_rate), 1) if spreadsheet_rate else None
+        std = round(float(spreadsheet_std), 1) if spreadsheet_std else None
 
         # Tank from clients tuple (master), fallback to Optimizer_Input
         client = by_id.get(cid)
@@ -231,25 +371,28 @@ def _client_list() -> List[Dict]:
         current_lbs = float(est_cur) if est_cur else 0
         pct = round(100 * current_lbs / tank, 0) if tank > 0 else 0
 
-        # DTE using SOLVER rate; fallback to spreadsheet DTE if rate missing
-        if solver_rate and solver_rate > 0:
-            dte = round(current_lbs / solver_rate, 1)
+        # DTE = current / rate. Spreadsheet's DTE column (now col 15 / idx 14)
+        # is the same calc; use ours so it stays in sync if Anova adjusts current.
+        if rate and rate > 0:
+            dte = round(current_lbs / rate, 1)
         else:
-            spreadsheet_dte = row[13]
-            dte = round(float(spreadsheet_dte), 1) if isinstance(spreadsheet_dte, (int, float)) else None
+            sheet_dte = row[14] if len(row) > 14 else None
+            dte = round(float(sheet_dte), 1) if isinstance(sheet_dte, (int, float)) else None
 
         rows.append({
             'id': cid,
             'name': str(name),
             'tank_lbs': tank,
-            'rate_lpd': solver_rate,                          # solver-correct
-            'rate_spreadsheet': round(float(spreadsheet_rate), 1) if spreadsheet_rate else None,
+            'rate_lpd': rate,
+            'rate_std_dev': std,
             'current_lbs': round(current_lbs, 1),
             'pct_full': pct,
             'dte': dte,
             'last_delivery': str(last_deliv)[:10] if last_deliv else None,
             'has_anova': anova_lvl is not None,
             'anova_age_h': round(float(anova_age), 1) if isinstance(anova_age, (int, float)) else None,
+            'dns': cid in dns_flagged,
+            'dns_reason': dns_flagged.get(cid, ''),
         })
     wb.close()
     rows.sort(key=lambda r: r['dte'] if r['dte'] is not None else 999)
@@ -669,12 +812,27 @@ def api_truck_avail_post():
 def api_run():
     body = request.get_json(force=True) or {}
     plan_date = body.get('date')
+    force = bool(body.get('force', False))
     if not plan_date:
         return jsonify({'ok': False, 'error': 'Missing date'}), 400
     try:
         date.fromisoformat(plan_date)
     except Exception:
         return jsonify({'ok': False, 'error': 'Bad date'}), 400
+
+    # Pre-flight: refuse to run on data we suspect is being edited / stale.
+    # Operator can override with force=true, but the warning is shown first.
+    f = _read_input_file()
+    if f is not None:
+        warns = _data_freshness_warnings(f)
+        blocks = [w for w in warns if w['severity'] == 'block']
+        if blocks and not force:
+            return jsonify({
+                'ok': False,
+                'blocked': True,
+                'warnings': warns,
+                'error': blocks[0]['message'],
+            }), 409
 
     with _run_lock:
         if _current_run['status'] == 'running':
@@ -694,7 +852,81 @@ def api_run():
     return jsonify({'ok': True})
 
 
+def _append_log(line: str) -> None:
+    """Push a line into the live run log (used by both pre-flight & solver)."""
+    with _run_lock:
+        _current_run['log'].append(line)
+        if len(_current_run['log']) > 500:
+            _current_run['log'] = _current_run['log'][-500:]
+
+
+def _ensure_matrix_up_to_date(input_file: Optional[Path]) -> bool:
+    """Auto-rebuild the OSRM matrix if any spreadsheet client is missing.
+
+    Returns True on success (matrix is now up-to-date), False on hard failure.
+    Streams progress into the run log so the operator sees what happened.
+    """
+    if input_file is None or not input_file.exists():
+        _append_log('   [matrix] no input file configured — skipping pre-flight')
+        return True
+
+    matrix_file = DATA_DIR / 'osrm_full_matrix_with_ids.npz'
+    try:
+        # Fast path: load matrix + clients, diff IDs locally.
+        import numpy as np
+        clients = load_clients(input_file)
+        routable = [c for c in clients
+                     if c.lat is not None and c.lon is not None]
+        if not matrix_file.exists():
+            missing_ids = [c.id for c in routable]
+            _append_log(f'   [matrix] file missing — will build {len(missing_ids)} clients')
+        else:
+            data = np.load(matrix_file, allow_pickle=True)
+            ids_in_matrix = set(data['client_ids'])
+            missing_ids = [c.id for c in routable if c.id not in ids_in_matrix]
+
+        if not missing_ids:
+            _append_log(f'   [matrix] ✓ up to date ({len(routable)} clients)')
+            return True
+
+        _append_log(f'   [matrix] ⚠ {len(missing_ids)} client(s) missing: '
+                    f'{", ".join(missing_ids[:8])}'
+                    + (' …' if len(missing_ids) > 8 else ''))
+        _append_log('   [matrix] rebuilding via OSRM (this can take ~30–60 s)…')
+
+        cmd = [sys.executable, '-u', '-m', 'final.build_matrix']
+        proc = subprocess.Popen(
+            cmd, cwd=str(REPO), env=dict(os.environ),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=1, text=True,
+        )
+        for line in proc.stdout:  # type: ignore
+            _append_log('   [matrix] ' + line.rstrip())
+        proc.wait()
+        if proc.returncode != 0:
+            _append_log(f'   [matrix] ✗ rebuild FAILED (exit {proc.returncode}) — '
+                        'aborting solver run')
+            return False
+        _append_log('   [matrix] ✓ rebuild complete — proceeding to solver')
+        return True
+    except Exception as e:
+        _append_log(f'   [matrix] ✗ pre-flight error: {e} — aborting solver run')
+        return False
+
+
 def _run_solver_thread(plan_date: str, solve_seconds: int):
+    # Pre-flight: make sure every spreadsheet client is in the OSRM matrix.
+    # New clients (e.g. PYNION, COWBOY COOKIN) would otherwise be silently
+    # dropped by the solver with a NOT_IN_MATRIX warning in the Deferred sheet.
+    matrix_ok = _ensure_matrix_up_to_date(_read_input_file())
+    if not matrix_ok:
+        with _run_lock:
+            _current_run['status'] = 'error'
+            _current_run['finished_at'] = time.time()
+            _current_run['elapsed_s'] = _current_run['finished_at'] - _current_run['started_at']
+            _current_run['returncode'] = -1
+        return
+
     cmd = [sys.executable, '-u', '-m', 'final.sk_solver_final',
            '--today', plan_date, '--solve-seconds', str(solve_seconds)]
     env = dict(os.environ)
@@ -705,10 +937,7 @@ def _run_solver_thread(plan_date: str, solve_seconds: int):
             bufsize=1, text=True,
         )
         for line in proc.stdout:  # type: ignore
-            with _run_lock:
-                _current_run['log'].append(line.rstrip())
-                if len(_current_run['log']) > 500:
-                    _current_run['log'] = _current_run['log'][-500:]
+            _append_log(line.rstrip())
         proc.wait()
         with _run_lock:
             _current_run['finished_at'] = time.time()
@@ -716,8 +945,8 @@ def _run_solver_thread(plan_date: str, solve_seconds: int):
             _current_run['returncode'] = proc.returncode
             _current_run['status'] = 'done' if proc.returncode == 0 else 'error'
     except Exception as e:
+        _append_log(f'ERROR: {e}')
         with _run_lock:
-            _current_run['log'].append(f'ERROR: {e}')
             _current_run['status'] = 'error'
             _current_run['finished_at'] = time.time()
             _current_run['elapsed_s'] = _current_run['finished_at'] - _current_run['started_at']

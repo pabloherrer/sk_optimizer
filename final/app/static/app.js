@@ -24,10 +24,9 @@ window.addEventListener('DOMContentLoaded', () => {
     renderClients();
     refreshTrucks();
   });
-  // Solver Tuning — min-fill-pct slider
-  const slider = $('#min-fill-pct');
-  slider.addEventListener('input', onMinFillSliderInput);
-  slider.addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
+  // Solver Tuning — sliders
+  $('#min-fill-pct').addEventListener('input', onMinFillSliderInput);
+  $('#min-fill-pct').addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
   refreshAll();
 });
 
@@ -92,6 +91,7 @@ function setMinFillHint(text, cls) {
   el.textContent = text;
   el.className = 'tuning-hint' + (cls ? ' ' + cls : '');
 }
+
 
 // ── Data Strip (top compact stats + file path) ────────────────────────────
 async function refreshHealthStrip() {
@@ -159,9 +159,24 @@ async function refreshHealthStrip() {
 
     $('#stat-clients').innerHTML =
       `<span class="stat-key">Clients</span><span class="stat-val">${h.client_count || 0} active <span style="color:var(--text-faint)">(${h.client_dns || 0} do-not-schedule)</span></span>`;
+
+    // Render any data-freshness warnings
+    renderWarnings(h.warnings || []);
   } catch (e) {
     $('#strip-file').textContent = `Error: ${e}`;
   }
+}
+
+function renderWarnings(warnings) {
+  const banner = $('#warn-banner');
+  if (!warnings.length) { banner.hidden = true; banner.innerHTML = ''; return; }
+  banner.hidden = false;
+  const icon = { block: '⛔', warn: '⚠️', info: 'ℹ️' };
+  banner.innerHTML = warnings.map(w =>
+    `<div class="warn-line ${w.severity === 'block' ? 'block' : ''}">
+       <span class="warn-icon">${icon[w.severity] || '·'}</span>
+       <span class="warn-msg">${escape(w.message)}</span>
+     </div>`).join('');
 }
 
 // ── File picker ───────────────────────────────────────────────────────────
@@ -384,24 +399,30 @@ function renderClients() {
       ? (r.anova_age_h != null ? `Anova ${r.anova_age_h.toFixed(1)}h ago` : 'Anova sensor')
       : 'No sensor';
 
-    // Rate column shows the SOLVER's rate (IQR-filtered, recency-weighted).
-    // If the spreadsheet's noisy "Last Per Day Cons" differs significantly,
-    // a warning icon (⚠️) is shown with explanation in the tooltip.
+    // Rate is the AVG from Optimizer_Input (operator-curated). Solver uses
+    // the same number. Tooltip surfaces Std Dev (variability) when present —
+    // higher std = more variable consumption = harder to predict.
     let rateLabel = r.rate_lpd != null ? `${r.rate_lpd}` : '—';
-    let rateTitle = `Used by solver (IQR-filtered): ${r.rate_lpd ?? '—'} lbs/day`;
-    if (r.rate_spreadsheet != null && r.rate_lpd != null) {
-      rateTitle += `\nSpreadsheet 'Last Per Day Cons': ${r.rate_spreadsheet} lbs/day`;
-      const ratio = r.rate_spreadsheet / r.rate_lpd;
-      if (ratio > 1.5 || ratio < 0.67) {
-        rateLabel = `${r.rate_lpd} <span style="color:var(--warn)" title="${escape(rateTitle)}">⚠</span>`;
-        rateTitle += '\n⚠ Spreadsheet rate may be skewed by a 1-day delivery gap. Solver uses the filtered value.';
+    let rateTitle = `AVG: ${r.rate_lpd ?? '—'} lbs/day (operator-curated)`;
+    if (r.rate_std_dev != null && r.rate_std_dev > 0 && r.rate_lpd) {
+      const cv = (r.rate_std_dev / r.rate_lpd * 100).toFixed(0);
+      rateTitle += `\nStd Dev: ±${r.rate_std_dev} lbs/day (CV ${cv}%)`;
+      // Flag high-variability clients (CV > 40%) — their DTE is fuzzier.
+      if ((r.rate_std_dev / r.rate_lpd) > 0.4) {
+        rateLabel = `${r.rate_lpd} <span style="color:var(--text-faint);font-size:10px">±${Math.round(r.rate_std_dev)}</span>`;
       }
     }
 
+    // DNS badge — visible flag that this client is Do-Not-Schedule.
+    // Row is also dimmed so it visually recedes from the actionable clients.
+    const dnsBadge = r.dns
+      ? `<span class="dns-badge" title="Do Not Schedule — ${escape(r.dns_reason)}\nEdit Client_List col Q to change.">DNS</span>`
+      : '';
+    const rowClass = r.dns ? 'dns-row' : '';
     return `
-      <tr data-cid="${escape(r.id)}">
+      <tr data-cid="${escape(r.id)}" class="${rowClass}">
         <td class="name-id">${escape(r.id)}</td>
-        <td class="name">${escape(displayName(r.name))}</td>
+        <td class="name">${escape(displayName(r.name))} ${dnsBadge}</td>
         <td class="num">${r.tank_lbs}</td>
         <td class="num">${Math.round(r.current_lbs)}</td>
         <td class="num">
@@ -497,6 +518,36 @@ async function onRunClick() {
     });
     const res = await r.json();
     if (!res.ok) {
+      // Blocked by data-freshness check? Offer override.
+      if (res.blocked) {
+        setStatus('error', 'Blocked');
+        $('#run-btn').disabled = false;
+        const ok = confirm(
+          'DATA FRESHNESS WARNING:\n\n' + (res.error || '') +
+          '\n\nRunning anyway WILL produce dangerous results if the file is mid-edit.\n\n' +
+          'Click OK only if you are sure the file is fully saved and synced.\n' +
+          'Click Cancel to fix and retry.'
+        );
+        if (ok) {
+          // re-fire with force=true
+          setStatus('running', 'Running…');
+          $('#run-btn').disabled = true;
+          const r2 = await fetch('/api/run', {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({date, solve_seconds: solveSecs, force: true}),
+          });
+          const res2 = await r2.json();
+          if (!res2.ok) {
+            setStatus('error', 'Error');
+            $('#run-btn').disabled = false;
+            alert(res2.error || 'Could not start run');
+            return;
+          }
+          startRunPolling();
+        }
+        return;
+      }
       setStatus('error', 'Error');
       $('#run-btn').disabled = false;
       alert(res.error || 'Could not start run');

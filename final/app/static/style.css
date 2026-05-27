@@ -39,8 +39,28 @@ html, body {
 
 body {
   display: grid;
-  grid-template-rows: 60px 44px 38px 1fr 26px;
+  grid-template-rows: 60px auto 44px 38px 1fr 26px;
 }
+
+/* Warning banner — hidden by default, shown when freshness checks fire */
+.warn-banner[hidden] { display: none !important; }
+.warn-banner {
+  background: #FFF4D1;
+  border-bottom: 2px solid var(--sk-gold-dark);
+  padding: 8px 20px;
+  font-size: 12.5px;
+  color: var(--text);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.warn-banner .warn-line { display: flex; align-items: flex-start; gap: 8px; }
+.warn-banner .warn-line.block {
+  background: #FBDDDA; border-left: 4px solid var(--danger);
+  padding: 6px 10px; margin: 2px 0;
+}
+.warn-banner .warn-icon { font-size: 14px; flex: 0 0 auto; }
+.warn-banner .warn-msg { flex: 1; }
+.warn-banner code { font-family: ui-monospace, Menlo, monospace;
+                    background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }
 
 /* ═══════════════════════════════ TOP BAR ═══════════════════════════════ */
 
@@ -307,6 +327,26 @@ body {
 .dte-cell.warning  { color: var(--warn); font-weight: 600; }
 .dte-cell.normal   { color: var(--text); }
 .dte-cell.safe     { color: var(--text-faint); }
+
+/* DNS (Do Not Schedule) flag — Client_List col Q */
+.dns-badge {
+  display: inline-block;
+  font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 1px 5px;
+  margin-left: 6px;
+  background: #FBDDDA; color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: 3px;
+  vertical-align: middle;
+  cursor: help;
+  text-transform: uppercase;
+}
+.client-table tr.dns-row td {
+  opacity: 0.55;
+  background: #FAFAFB;
+}
+.client-table tr.dns-row:hover td { opacity: 0.85; background: #F4F6F8; }
 
 .pct-bar {
   display: inline-block; width: 36px; height: 4px;

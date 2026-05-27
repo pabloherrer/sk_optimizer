@@ -390,16 +390,28 @@ def _resolve_tank_level(
         return lbs, 'manual', manual.as_of
 
     if anova is not None and anova['source'] in ('sensor', 'sensor-projected'):
-        if anova['source'] == 'sensor':
-            lbs = max(0.0, min(cap, float(anova['level_lbs'])))
-        else:
-            # Project forward by rate × hours-of-staleness
-            days_stale = float(anova['age_hours']) / 24.0
-            projected = float(anova['level_lbs']) - rate_lbs_per_day * days_stale
-            lbs = max(0.0, min(cap, projected))
-        ts = anova['timestamp']
-        as_of = ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts
-        return lbs, anova['source'], as_of
+        # SAFEGUARD: ignore Anova if it was recorded BEFORE the latest delivery.
+        # An older Anova reading would still show the pre-delivery (depleted)
+        # tank level, making the solver think a freshly-refilled customer is
+        # nearly empty — causing wrong-day dispatch (MANUEL PEORIA bug).
+        anova_ts = anova['timestamp']
+        anova_dt = (anova_ts.to_pydatetime()
+                     if hasattr(anova_ts, 'to_pydatetime') else anova_ts)
+        anova_too_old_vs_delivery = False
+        if last_delivery is not None:
+            last_dt = pd.Timestamp(last_delivery['date']).to_pydatetime()
+            if anova_dt < last_dt:
+                anova_too_old_vs_delivery = True
+        if not anova_too_old_vs_delivery:
+            if anova['source'] == 'sensor':
+                lbs = max(0.0, min(cap, float(anova['level_lbs'])))
+            else:
+                # Project forward by rate × hours-of-staleness
+                days_stale = float(anova['age_hours']) / 24.0
+                projected = float(anova['level_lbs']) - rate_lbs_per_day * days_stale
+                lbs = max(0.0, min(cap, projected))
+            return lbs, anova['source'], anova_dt
+        # Anova is stale relative to delivery — fall through to formula estimate
 
     # Formula estimate: cap − days_since_last × rate
     if last_delivery is not None:
