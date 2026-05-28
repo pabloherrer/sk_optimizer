@@ -71,7 +71,59 @@ def write_all_outputs(
     write_smartservice_csv(plan, target_day, csv_path,
                            shift_start_min=shift_start_min)
 
-    archive_path = write_plan_archive(plan, output_dir)
+    # Snapshot each client's PRE-RUN tank urgency so the dashboard can
+    # render "what was urgent before the run" next to "what the solver
+    # picked." Reasoning: once the run commits, Excel formulas re-project
+    # tank state and colors shift — the operator loses the baseline they
+    # used to prioritize. Freezing the bucket here preserves it forever.
+    #
+    # Buckets match the spreadsheet's color coding (Optimizer_Input):
+    #   RED  : days-to-reserve ≤ 2
+    #   YEL  : days-to-reserve ≤ 5
+    #   GRN  : days-to-reserve ≤ 7
+    #   GRY  : days-to-reserve > 7  (or no rate / unknown)
+    extras: Dict[str, object] = {}
+    if problem is not None:
+        reserve_pct = float(getattr(problem, 'min_reserve_fraction', 0.10) or 0.10)
+        snapshot = []
+        client_by_id = {c.id: c for c in problem.clients}
+        for cid, ts in problem.initial_tanks.items():
+            c = client_by_id.get(cid)
+            if c is None:
+                continue
+            rate = float(ts.rate_lbs_per_day or 0.0)
+            tank = float(c.tank_capacity_lbs or 0.0)
+            current = float(ts.current_lbs or 0.0)
+            reserve_lbs = tank * reserve_pct
+            if rate > 0 and tank > 0:
+                dte_to_reserve = max(0.0, (current - reserve_lbs) / rate)
+            else:
+                dte_to_reserve = None
+            if dte_to_reserve is None:
+                bucket = 'GRY'
+            elif dte_to_reserve <= 2:
+                bucket = 'RED'
+            elif dte_to_reserve <= 5:
+                bucket = 'YEL'
+            elif dte_to_reserve <= 7:
+                bucket = 'GRN'
+            else:
+                bucket = 'GRY'
+            snapshot.append({
+                'client_id': cid,
+                'customer':  c.customer,
+                'tank_lbs':  tank,
+                'current_lbs': round(current, 1),
+                'rate_lbs_per_day': round(rate, 1),
+                'reserve_lbs': round(reserve_lbs, 1),
+                'dte_to_reserve': (round(dte_to_reserve, 2)
+                                    if dte_to_reserve is not None else None),
+                'urgency_bucket': bucket,
+            })
+        extras['pre_run_urgency'] = snapshot
+        extras['pre_run_reserve_pct'] = reserve_pct
+
+    archive_path = write_plan_archive(plan, output_dir, extras=extras)
 
     return {
         'excel':   excel_path,

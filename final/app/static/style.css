@@ -498,6 +498,145 @@ body {
   font-size: 11px; color: var(--info); cursor: pointer;
 }
 
+/* ═══════════════════════════════ CARD HEADER GROUPING ═══════════════════════════════ */
+/* Right side of card header that holds button + stamp together */
+.card-header-right {
+  display: flex; align-items: center; gap: 10px;
+}
+
+/* ═══════════════════════════════ URGENCY MATRIX MODAL ═══════════════════════════════ */
+
+.modal-wide {
+  width: 95%; max-width: 1400px; max-height: 92%;
+}
+
+.modal-sub {
+  font-size: 11px; color: var(--text-faint);
+  margin-top: 2px;
+}
+
+.urgency-summary {
+  display: flex; flex-wrap: wrap; gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: #FAFBFC;
+  font-size: 12px;
+}
+.urg-tally { display: inline-flex; align-items: center; gap: 6px; }
+.urg-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.urg-dot.red { background: var(--danger); }
+.urg-dot.yel { background: var(--sk-gold-dark); }
+.urg-dot.grn { background: var(--success); }
+.urg-dot.gry { background: var(--text-faint); }
+.urg-tally b { font-variant-numeric: tabular-nums; }
+.urg-misses {
+  color: var(--danger); font-weight: 700;
+  padding: 2px 8px; border-radius: 99px;
+  background: #FBDDDA;
+}
+.urg-misses.zero { color: var(--success); background: #DBF3E4; }
+.urg-reserve {
+  margin-left: auto; color: var(--text-soft); font-size: 11px;
+}
+
+/* Filter pill group in the modal header */
+.urgency-filter-group {
+  display: inline-flex; gap: 0;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.urgency-filter {
+  font: inherit; font-size: 11.5px; font-weight: 500;
+  background: white; color: var(--text-soft);
+  border: none; padding: 5px 10px; cursor: pointer;
+  border-right: 1px solid var(--border);
+}
+.urgency-filter:last-child { border-right: none; }
+.urgency-filter:hover { background: #F4F6F8; }
+.urgency-filter.active {
+  background: var(--sk-green); color: white;
+}
+
+/* The matrix itself */
+.urgency-body { flex: 1; overflow: auto; padding: 0; }
+.urg-table {
+  width: 100%; border-collapse: collapse;
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.urg-table thead {
+  position: sticky; top: 0; background: white; z-index: 2;
+}
+.urg-table th {
+  font-size: 10px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--text-soft);
+  border-bottom: 2px solid var(--border-strong);
+  padding: 8px 6px;
+  text-align: center;
+  white-space: nowrap;
+}
+.urg-table th.day-col.committed { background: #F4FAF0; color: var(--sk-green-dark); }
+.urg-table th.day-col.preview   { background: #FAFBFC; color: var(--text-faint); }
+.urg-table th.customer-col { text-align: left; padding-left: 12px; min-width: 200px; }
+.urg-table th.note-col { text-align: left; padding-left: 12px; min-width: 180px; }
+.urg-table th.dte-col { text-align: right; }
+
+.urg-table tbody tr { border-bottom: 1px solid var(--border); }
+.urg-table tbody tr:hover { background: #F8FAFB; }
+
+/* The frozen bucket color stripe on the left edge */
+.urg-table td.bucket-cell {
+  width: 6px; padding: 0; border-left: 6px solid var(--text-faint);
+}
+.urg-table tr.bucket-RED td.bucket-cell { border-left-color: var(--danger); }
+.urg-table tr.bucket-YEL td.bucket-cell { border-left-color: var(--sk-gold-dark); }
+.urg-table tr.bucket-GRN td.bucket-cell { border-left-color: var(--success); }
+.urg-table tr.bucket-GRY td.bucket-cell { border-left-color: var(--border-strong); }
+
+.urg-table tr.bucket-GRY td { color: var(--text-faint); }
+
+.urg-table td {
+  padding: 6px 6px;
+  text-align: center;
+  vertical-align: middle;
+}
+.urg-table td.customer-cell {
+  text-align: left; padding-left: 12px;
+  font-weight: 500;
+}
+.urg-table td.customer-cell .cust-id {
+  color: var(--text-faint); font-size: 10.5px; margin-right: 6px;
+}
+.urg-table td.dte-cell { text-align: right; padding-right: 12px; font-weight: 600; }
+.urg-table tr.bucket-RED td.dte-cell { color: var(--danger); }
+.urg-table tr.bucket-YEL td.dte-cell { color: var(--sk-gold-dark); }
+.urg-table tr.bucket-GRN td.dte-cell { color: var(--success); }
+
+/* Day cells — show truck assignment when scheduled */
+.urg-table td.day-cell { padding: 4px; }
+.urg-table td.day-cell.committed { background: #F4FAF0; }
+.urg-table td.day-cell.preview   { background: #FAFBFC; }
+.day-pill {
+  display: inline-block;
+  padding: 2px 6px; border-radius: 3px;
+  font-size: 10.5px; font-weight: 700;
+  color: white;
+}
+.day-pill.t2 { background: var(--sk-green-dark); }
+.day-pill.t9 { background: var(--info); }
+.day-pill.other { background: var(--text-soft); }
+.day-cell .empty-dot { color: var(--text-faint); }
+
+/* Note column */
+.urg-table td.note-cell {
+  text-align: left; padding-left: 12px;
+  color: var(--text-soft); font-size: 11px;
+}
+.urg-table td.note-cell .ok    { color: var(--success); font-weight: 600; }
+.urg-table td.note-cell .miss  { color: var(--danger); font-weight: 700; }
+.urg-table td.note-cell .info  { color: var(--text-faint); }
+.urg-table td.note-cell .lbs   { font-variant-numeric: tabular-nums; color: var(--text); }
+
 /* ═══════════════════════════════ MODAL ═══════════════════════════════ */
 
 .modal-backdrop[hidden] { display: none !important; }

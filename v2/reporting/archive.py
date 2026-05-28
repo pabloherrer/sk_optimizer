@@ -42,9 +42,15 @@ def _plan_to_dict(plan) -> dict:
     return d
 
 
-def write_plan_archive(plan, output_dir: Path) -> Path:
+def write_plan_archive(plan, output_dir: Path,
+                        extras: dict | None = None) -> Path:
     """
     Dump `plan` as JSON at `<output_dir>/archive/plan_<today>.json`.
+
+    `extras` is merged into the top-level payload (non-overlapping keys
+    only — Plan fields win). Useful for stashing one-time snapshots like
+    pre-run tank urgency so dashboards can render "what was urgent
+    BEFORE the run" alongside "what the solver picked."
 
     Returns the path written.
     """
@@ -53,6 +59,9 @@ def write_plan_archive(plan, output_dir: Path) -> Path:
     today = plan.today.isoformat() if isinstance(plan.today, date) else str(plan.today)
     path = archive_dir / f'plan_{today}.json'
     payload = _plan_to_dict(plan)
+    if extras:
+        for k, v in extras.items():
+            payload.setdefault(k, v)   # don't overwrite Plan fields
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, default=_json_default, indent=2)
     return path

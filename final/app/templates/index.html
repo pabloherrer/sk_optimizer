@@ -161,7 +161,13 @@
     <section class="card card-plan">
       <header class="card-header">
         <h2>Last Plan</h2>
-        <span class="card-hint" id="plan-stamp"></span>
+        <span class="card-header-right">
+          <button class="btn-mini-flat" id="urgency-btn" disabled
+                  title="Side-by-side view: pre-run urgency vs solver's schedule">
+            📊 Urgency Matrix
+          </button>
+          <span class="card-hint" id="plan-stamp"></span>
+        </span>
       </header>
       <div class="card-body" id="plan-body">
         <div class="empty">No plan yet — click <b>Run</b> to build one.</div>
@@ -187,6 +193,32 @@
       <button class="btn-mini-flat" onclick="closeRunLog()">Close</button>
     </header>
     <pre id="run-log" class="run-log"></pre>
+  </div>
+</div>
+
+<!-- Urgency Lock Matrix modal — opened from Last Plan card's button.
+     Side-by-side view: pre-run urgency (frozen color) vs solver's
+     scheduled day. Same close patterns as run log. -->
+<div class="modal-backdrop" id="urgency-modal" hidden onclick="closeUrgencyIfBackdrop(event)">
+  <div class="modal modal-wide" onclick="event.stopPropagation()">
+    <header class="modal-header">
+      <div>
+        <h3 style="margin: 0;">Urgency Lock Matrix</h3>
+        <div class="modal-sub" id="urgency-stamp"></div>
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <span class="urgency-filter-group">
+          <button class="urgency-filter" data-filter="all">All</button>
+          <button class="urgency-filter" data-filter="urgent">Urgent only</button>
+          <button class="urgency-filter" data-filter="misses">Misses only</button>
+        </span>
+        <button class="btn-mini-flat" onclick="closeUrgencyMatrix()">Close</button>
+      </div>
+    </header>
+    <div class="urgency-summary" id="urgency-summary"></div>
+    <div class="urgency-body" id="urgency-body">
+      <div class="loading" style="padding: 20px;">Loading…</div>
+    </div>
   </div>
 </div>
 

@@ -736,6 +736,126 @@ def api_last_plan():
     return jsonify(plan)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# URGENCY LOCK MATRIX — operator's "did the solver do the right thing?" view
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Joins the latest plan archive's `pre_run_urgency` snapshot (the operator's
+# coloring AT RUN TIME — never re-calculates) with the routes (where the
+# solver actually scheduled each client). The result is a per-client row:
+#   - frozen urgency bucket
+#   - the day-index the solver picked (or null = deferred)
+#   - which truck, refill lbs
+#   - deferred reason if not served
+#
+# Sorted RED → YEL → GRN → GRY. Within each bucket, by DTE ascending.
+
+@app.route('/api/urgency-matrix')
+def api_urgency_matrix():
+    archive_dir = OUTPUT_DIR / 'archive'
+    if not archive_dir.exists():
+        return jsonify({'ok': False, 'error': 'No plan archive yet — click RUN'})
+    files = sorted(archive_dir.glob('plan_*.json'), key=lambda p: p.stat().st_mtime)
+    if not files:
+        return jsonify({'ok': False, 'error': 'No plan archive yet — click RUN'})
+
+    try:
+        plan = json.loads(files[-1].read_text(encoding='utf-8'))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Could not read archive: {e}'})
+
+    snapshot = plan.get('pre_run_urgency') or []
+    if not snapshot:
+        return jsonify({
+            'ok': False,
+            'error': ('This plan was produced before the urgency snapshot '
+                       'feature was added. Run again to see the matrix.'),
+        })
+
+    today_iso = plan.get('today', '')
+    horizon_iso = plan.get('horizon_dates', [])
+    horizon_dates = [date.fromisoformat(d) for d in horizon_iso]
+    commit_days = int(plan.get('commit_days', 2))
+
+    # Build cid → (day_index, truck, refill_lbs, urgency_tier) from routes
+    scheduled: Dict[str, Dict] = {}
+    for r in plan.get('routes', []):
+        rd_str = r.get('date')
+        truck_id = r.get('truck_id')
+        route_data = r.get('route', r) if isinstance(r, dict) else {}
+        try:
+            day_idx = horizon_iso.index(rd_str)
+        except (ValueError, TypeError):
+            day_idx = None
+        for stop in (route_data.get('stops') or []):
+            cid = str(stop.get('client_id', ''))
+            if not cid:
+                continue
+            scheduled[cid] = {
+                'day_index':  day_idx,
+                'date':       rd_str,
+                'truck':      str(truck_id) if truck_id else None,
+                'refill_lbs': float(stop.get('delivery_lbs') or 0),
+                'sequence':   int(stop.get('sequence') or 0),
+            }
+
+    deferred_map = plan.get('deferred') or {}
+
+    # Bucket ordering for the matrix
+    bucket_order = {'RED': 0, 'YEL': 1, 'GRN': 2, 'GRY': 3}
+
+    rows = []
+    for s in snapshot:
+        cid = str(s.get('client_id', ''))
+        bucket = s.get('urgency_bucket', 'GRY')
+        dte = s.get('dte_to_reserve')
+        sched = scheduled.get(cid)
+        deferred_reason = deferred_map.get(cid)
+        is_urgent_miss = (
+            bucket in ('RED', 'YEL') and sched is None and deferred_reason is not None
+        )
+        rows.append({
+            'client_id':      cid,
+            'customer':       s.get('customer'),
+            'tank_lbs':       s.get('tank_lbs'),
+            'current_lbs':    s.get('current_lbs'),
+            'rate_lbs_per_day': s.get('rate_lbs_per_day'),
+            'dte_to_reserve': dte,
+            'urgency_bucket': bucket,
+            'scheduled':      sched,        # None if deferred
+            'deferred_reason': deferred_reason,
+            'urgent_miss':    is_urgent_miss,
+        })
+
+    # Sort: bucket priority, then dte asc (most urgent first within bucket)
+    rows.sort(key=lambda r: (
+        bucket_order.get(r['urgency_bucket'], 9),
+        r['dte_to_reserve'] if r['dte_to_reserve'] is not None else 999,
+    ))
+
+    # Tally for header
+    counts = {'RED': 0, 'YEL': 0, 'GRN': 0, 'GRY': 0}
+    misses = 0
+    for r in rows:
+        counts[r['urgency_bucket']] = counts.get(r['urgency_bucket'], 0) + 1
+        if r['urgent_miss']:
+            misses += 1
+
+    return jsonify({
+        'ok':           True,
+        'today':        today_iso,
+        'horizon':      [{'date': d.isoformat(),
+                          'label': d.strftime('%a %m/%d'),
+                          'committed': i < commit_days}
+                          for i, d in enumerate(horizon_dates)],
+        'commit_days':  commit_days,
+        'reserve_pct':  plan.get('pre_run_reserve_pct', 0.10),
+        'counts':       counts,
+        'urgent_misses': misses,
+        'rows':         rows,
+    })
+
+
 @app.route('/api/overrides', methods=['GET'])
 def api_overrides_get():
     if not USER_OVERRIDES.exists():

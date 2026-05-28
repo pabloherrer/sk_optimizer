@@ -27,6 +27,8 @@ window.addEventListener('DOMContentLoaded', () => {
   // Solver Tuning — sliders
   $('#min-fill-pct').addEventListener('input', onMinFillSliderInput);
   $('#min-fill-pct').addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
+  // Urgency Matrix modal
+  $('#urgency-btn').addEventListener('click', openUrgencyMatrix);
   refreshAll();
 });
 
@@ -210,9 +212,11 @@ async function refreshLastPlan() {
       $('#plan-stamp').textContent = '';
       $('#horizon-days').textContent = '10';
       $('#commit-days').textContent = '2';
+      $('#urgency-btn').disabled = true;
       return;
     }
     STATE.lastPlanToday = p.today;
+    $('#urgency-btn').disabled = false;
 
     $('#horizon-days').textContent = p.horizon_days;
     $('#commit-days').textContent = p.commit_days;
@@ -658,16 +662,169 @@ function closeRunLogIfBackdrop(ev) {
   // Only close if user clicked the backdrop itself (not its child .modal)
   if (ev.target.id === 'run-log-modal') closeRunLog();
 }
-// Escape key closes the modal
+// Escape key closes whichever modal is currently open
 document.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Escape') {
-    const m = document.getElementById('run-log-modal');
-    if (m && !m.hidden) closeRunLog();
-  }
+  if (ev.key !== 'Escape') return;
+  const log = document.getElementById('run-log-modal');
+  if (log && !log.hidden) { closeRunLog(); return; }
+  const urg = document.getElementById('urgency-modal');
+  if (urg && !urg.hidden) { closeUrgencyMatrix(); return; }
 });
+
+
+// ── Urgency Lock Matrix modal ─────────────────────────────────────────────
+//
+// Side-by-side view: frozen pre-run urgency (left edge color) vs the day
+// the solver actually scheduled each client. Lets the operator scan top-
+// down to confirm RED rows landed in day 0–1 and nothing urgent slipped.
+
+const URG_STATE = { data: null, filter: 'all' };
+
+async function openUrgencyMatrix() {
+  const modal = document.getElementById('urgency-modal');
+  modal.hidden = false;
+  document.getElementById('urgency-body').innerHTML = `<div class="loading" style="padding:20px;">Loading…</div>`;
+  try {
+    const r = await fetch('/api/urgency-matrix');
+    const data = await r.json();
+    if (!data.ok) {
+      document.getElementById('urgency-body').innerHTML =
+        `<div class="empty" style="padding:20px;">${escape(data.error || 'Unknown error')}</div>`;
+      return;
+    }
+    URG_STATE.data = data;
+    URG_STATE.filter = 'all';
+    renderUrgencyMatrix();
+    // Wire filter buttons (re-bound each open in case modal was rebuilt)
+    document.querySelectorAll('.urgency-filter').forEach(b => {
+      b.onclick = () => {
+        URG_STATE.filter = b.dataset.filter;
+        renderUrgencyMatrix();
+      };
+    });
+  } catch (e) {
+    document.getElementById('urgency-body').innerHTML =
+      `<div class="empty" style="padding:20px;">Error: ${escape(String(e))}</div>`;
+  }
+}
+
+function closeUrgencyMatrix() {
+  document.getElementById('urgency-modal').hidden = true;
+}
+function closeUrgencyIfBackdrop(ev) {
+  if (ev.target.id === 'urgency-modal') closeUrgencyMatrix();
+}
+
+function renderUrgencyMatrix() {
+  const data = URG_STATE.data;
+  if (!data) return;
+  const horizon = data.horizon || [];
+  const commitDays = data.commit_days || 2;
+
+  // Stamp + reserve % in subheader
+  document.getElementById('urgency-stamp').textContent =
+    `Plan for ${data.today} · ${horizon.length}-day horizon · reserve threshold ${Math.round((data.reserve_pct||0.1)*100)}% (sheet C2)`;
+
+  // Summary tally
+  const counts = data.counts || {};
+  const misses = data.urgent_misses || 0;
+  const summaryHTML = `
+    <span class="urg-tally"><span class="urg-dot red"></span>RED <b>${counts.RED||0}</b></span>
+    <span class="urg-tally"><span class="urg-dot yel"></span>YEL <b>${counts.YEL||0}</b></span>
+    <span class="urg-tally"><span class="urg-dot grn"></span>GRN <b>${counts.GRN||0}</b></span>
+    <span class="urg-tally"><span class="urg-dot gry"></span>GRY <b>${counts.GRY||0}</b></span>
+    <span class="urg-misses ${misses === 0 ? 'zero' : ''}">${misses === 0 ? '✓ No urgent misses' : `⚠ ${misses} urgent miss${misses === 1 ? '' : 'es'}`}</span>
+    <span class="urg-reserve">Pre-run snapshot — frozen at run time, won't shift as data updates.</span>
+  `;
+  document.getElementById('urgency-summary').innerHTML = summaryHTML;
+
+  // Update filter button "active" highlight
+  document.querySelectorAll('.urgency-filter').forEach(b => {
+    b.classList.toggle('active', b.dataset.filter === URG_STATE.filter);
+  });
+
+  // Filter rows
+  let rows = data.rows || [];
+  if (URG_STATE.filter === 'urgent') {
+    rows = rows.filter(r => r.urgency_bucket === 'RED' || r.urgency_bucket === 'YEL');
+  } else if (URG_STATE.filter === 'misses') {
+    rows = rows.filter(r => r.urgent_miss);
+  }
+
+  // Build header
+  const dayHeaders = horizon.map((h, i) => {
+    const cls = h.committed ? 'committed' : 'preview';
+    return `<th class="day-col ${cls}" title="${h.date}">${escape(h.label)}</th>`;
+  }).join('');
+
+  // Build body
+  const bodyHTML = rows.map(r => {
+    const sched = r.scheduled;
+    const schedDay = sched ? sched.day_index : null;
+    const dayCells = horizon.map((h, i) => {
+      const cls = h.committed ? 'committed' : 'preview';
+      if (sched && schedDay === i) {
+        const truck = sched.truck || '';
+        const tclass = truck === 'Truck2' ? 't2' : truck === 'Truck9' ? 't9' : 'other';
+        const label = truck === 'Truck2' ? 'T2' : truck === 'Truck9' ? 'T9' : '●';
+        return `<td class="day-cell ${cls}"><span class="day-pill ${tclass}" title="${escape(truck)} · ${Math.round(sched.refill_lbs)} lbs">${label}</span></td>`;
+      }
+      return `<td class="day-cell ${cls}"><span class="empty-dot">·</span></td>`;
+    }).join('');
+
+    // Note column logic
+    let noteHTML;
+    if (r.urgent_miss) {
+      noteHTML = `<span class="miss">⚠ DEFERRED</span> <span class="info">— ${escape(r.deferred_reason || '')}</span>`;
+    } else if (sched === null) {
+      // Deferred but not flagged as urgent miss (e.g. DNS, NOT_NEEDED_THIS_HORIZON)
+      noteHTML = `<span class="info">— ${escape(r.deferred_reason || 'deferred')}</span>`;
+    } else {
+      // Scheduled
+      const lbs = Math.round(sched.refill_lbs || 0).toLocaleString();
+      const onTime = (r.urgency_bucket === 'RED' && schedDay <= 1)
+                  || (r.urgency_bucket === 'YEL' && schedDay <= 4)
+                  || (r.urgency_bucket === 'GRN')
+                  || (r.urgency_bucket === 'GRY');
+      const tag = onTime ? '<span class="ok">✓ on-time</span>'
+                          : (r.urgency_bucket === 'RED' ? '<span class="miss">⚠ late</span>' : '<span class="info">late-ok</span>');
+      noteHTML = `<span class="lbs">${lbs} lbs</span> · ${tag}`;
+    }
+
+    const dteTxt = r.dte_to_reserve != null ? r.dte_to_reserve.toFixed(1) : '—';
+    return `
+      <tr class="bucket-${r.urgency_bucket}">
+        <td class="bucket-cell"></td>
+        <td class="customer-cell">
+          <span class="cust-id">${escape(r.client_id)}</span>${escape(r.customer || '')}
+        </td>
+        <td class="dte-cell">${dteTxt}</td>
+        ${dayCells}
+        <td class="note-cell">${noteHTML}</td>
+      </tr>`;
+  }).join('');
+
+  const tableHTML = `
+    <table class="urg-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th class="customer-col">Customer</th>
+          <th class="dte-col" title="Days until tank hits ${Math.round((data.reserve_pct||0.1)*100)}% reserve (frozen at run time)">DTE</th>
+          ${dayHeaders}
+          <th class="note-col">Note</th>
+        </tr>
+      </thead>
+      <tbody>${bodyHTML || '<tr><td colspan="20" style="padding:20px;text-align:center;color:var(--text-faint);">No clients match this filter.</td></tr>'}</tbody>
+    </table>`;
+  document.getElementById('urgency-body').innerHTML = tableHTML;
+}
+
 
 // Expose to inline onclick handlers
 window.toggleTruck = toggleTruck;
 window.doOverride = doOverride;
 window.closeRunLog = closeRunLog;
 window.closeRunLogIfBackdrop = closeRunLogIfBackdrop;
+window.closeUrgencyMatrix = closeUrgencyMatrix;
+window.closeUrgencyIfBackdrop = closeUrgencyIfBackdrop;

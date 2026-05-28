@@ -1058,8 +1058,19 @@ def write_plan_excel(
     _build_at_risk(wb.create_sheet(), plan, phones, problem=problem)
     _build_deferred(wb.create_sheet(), plan, problem=problem)
 
-    # Per-day printables — one sheet per delivery day that has any route
-    days_with_routes = sorted({d for (d, _) in plan.routes.keys()})
+    # Per-day printables — ONE SHEET PER COMMIT-WINDOW DAY ONLY.
+    #
+    # Why limit to the commit window: PRINT sheets are landscape, driver-
+    # facing handouts ("here is YOUR run today"). Preview days will be
+    # re-solved tomorrow when conditions change, so a printout for
+    # day 4 is fiction that confuses drivers and wastes paper. The full
+    # horizon view still lives in "Week outlook" and the HTML route map
+    # for dispatcher reference — they're not eliminated, just kept off
+    # the driver sheet.
+    commit_set = set(plan.horizon_dates[:plan.commit_days])
+    days_with_routes = sorted({
+        d for (d, _) in plan.routes.keys() if d in commit_set
+    })
     for d in days_with_routes:
         _build_print_day(wb.create_sheet(), plan, d, phones, problem=problem)
 

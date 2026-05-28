@@ -158,6 +158,27 @@ DROP_PENALTY_LOW  = 5.0         # truly deferable — only serve if free
 # tanks drain to empty." Lower = more visits / safer; higher = fewer.
 TARGET_EMPTY_FRACTION = 0.30    # visit by 30% full = 70% empty
 
+# Two-tier reserve penalty (operator-confirmed IRP framing):
+#   • Below RESERVE_PCT (default 10%): "urgency starts ramping" — the
+#     solver pays a moderate per-day price for visiting later. Doesn't
+#     force route churn; just nudges the assignment toward earlier days
+#     when other costs are comparable.
+#   • Below 0 (empty): catastrophic. The slope is 100× the reserve slope
+#     so the solver will burn miles to avoid stockouts.
+#
+# Picked $5/day past reserve and $500/day past empty. At COST_SCALE=1000
+# this becomes 5000 / 500_000 cost-units per day. For reference, $0.55
+# per mile (mileage rate) ≈ 550 cost-units, so 1 day past reserve costs
+# ~9 miles of detour — about right operationally. 1 day past empty
+# costs ~900 miles → never happens unless infeasible.
+#
+# RESERVE_PCT is read from Optimizer_Input cell C2 at runtime (the
+# spreadsheet's "Min Oil %" setting — operator's single source of
+# truth). Falls back to 0.10 if the cell is missing or invalid.
+RESERVE_PCT_DEFAULT          = 0.10
+RESERVE_PENALTY_PER_DAY      = 5.0      # $/day-past-reserve at visit
+EMPTY_PENALTY_PER_DAY        = 500.0    # $/day-past-empty at visit (100× reserve)
+
 # Commit window — first N working days are firm; urgent clients (DTE within
 # commit window + buffer) are LOCKED to this window.
 COMMIT_BUFFER_DAYS = 0.5        # clients with DTE ≤ commit_days + 0.5 are locked
@@ -341,6 +362,37 @@ def _load_sheet_est_current(input_file: Path) -> Dict[str, float]:
             if 'est_current' in v}
 
 
+def _load_sheet_reserve_pct(input_file: Path,
+                              default: float = RESERVE_PCT_DEFAULT) -> float:
+    """Read the operator's reserve % from Optimizer_Input cell C2 ("Min Oil %").
+
+    This is the threshold below which the solver should consider the tank
+    "into the safety reserve" and start penalizing later visit days.
+    Single source of truth — same value that drives the sheet's "Next
+    Delivery By" column. Falls back to `default` if cell missing/invalid.
+    """
+    try:
+        import openpyxl as _ox
+        wb = _ox.load_workbook(input_file, data_only=True, read_only=True)
+        if 'Optimizer_Input' not in wb.sheetnames:
+            wb.close()
+            return default
+        ws = wb['Optimizer_Input']
+        v = ws.cell(2, 3).value     # C2
+        wb.close()
+        if v is None:
+            return default
+        f = float(v)
+        # Sanity: must be between 0 and 0.5 (operator might enter 10 vs 0.10)
+        if 0.0 < f < 1.0:
+            return f
+        if 1.0 <= f <= 50.0:
+            return f / 100.0       # operator entered 10 instead of 0.10
+        return default
+    except Exception:
+        return default
+
+
 def build_augmented_problem(
     config_dir: Path,
     input_file: Path,
@@ -479,9 +531,20 @@ def build_augmented_problem(
     SHIFT_TARGET_MIN = 480       # 8 hours of driving (standard target)
     SHIFT_HARD_MAX_MIN = 615     # 10h 15m (6 AM → 5 PM minus load/unload)
 
+    # Read reserve % from sheet cell C2 — single source of truth shared
+    # with the spreadsheet's "Next Delivery By" formula. Falls back to
+    # policy.yaml's value (also 0.10) if cell is missing/invalid.
+    reserve_pct = _load_sheet_reserve_pct(input_file, default=base.min_reserve_fraction)
+    if abs(reserve_pct - base.min_reserve_fraction) > 1e-6:
+        print(f"  Reserve %: overriding policy.yaml ({base.min_reserve_fraction:.0%}) "
+              f"with spreadsheet C2 ({reserve_pct:.0%})")
+    else:
+        print(f"  Reserve %: {reserve_pct:.0%} (from spreadsheet C2)")
+
     augmented = replace(
         base,
         initial_tanks=updated_tanks,
+        min_reserve_fraction=reserve_pct,
         cost_per_mile=COST_PER_MILE,
         cost_per_minute_labor=COST_PER_MINUTE_LABOR_REG,
         # overtime_multiplier kept at YAML value (1.5) — used internally below
@@ -679,31 +742,23 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
     # INSERTION first-solution strategy uses for insertion positions —
     # negative arc costs confused it.
     #
-    # Reverted to ZERO rewards. Urgency now influences scheduling only
-    # via the structural constraints:
-    #   - GRACE_EMPTY=0 locks already-empty clients to day 0
-    #   - DROP_PENALTY tiers (HARD/HIGH/MED/LOW) for end-of-horizon defer
-    #   - Cost-callback only models real costs (miles + small-stop fee).
-    URGENCY_BONUS_PER_DTE_TIER = {
-        'stockout': 0.0,
-        'critical': 0.0,
-        'urgent':   0.0,
-        'soon':     0.0,
-        'normal':   0.0,
-        'far':      0.0,
-    }
-    REFILL_REWARD_PER_LB = 0.0
-
-    def _urgency_bonus_dollars(dte_at_day: float) -> float:
-        if dte_at_day <= 0:    return URGENCY_BONUS_PER_DTE_TIER['stockout']
-        if dte_at_day <= 1.5:  return URGENCY_BONUS_PER_DTE_TIER['critical']
-        if dte_at_day <= 3.0:  return URGENCY_BONUS_PER_DTE_TIER['urgent']
-        if dte_at_day <= 7.0:  return URGENCY_BONUS_PER_DTE_TIER['soon']
-        if dte_at_day <= 14.0: return URGENCY_BONUS_PER_DTE_TIER['normal']
-        return URGENCY_BONUS_PER_DTE_TIER['far']
+    # NEW: two-tier reserve penalty (IRP framing).
+    #   • If the tank at visit-day d is below RESERVE_PCT × capacity:
+    #     pay RESERVE_PENALTY_PER_DAY per day below. Soft nudge — solver
+    #     prefers earlier days but may still pick a later day when miles
+    #     are scarce.
+    #   • If the tank at visit-day d is below ZERO (stockout):
+    #     pay EMPTY_PENALTY_PER_DAY (100× the reserve slope). Stockouts
+    #     effectively forbidden.
+    # Both expressed in $; multiplied by COST_SCALE to integer mills, so
+    # they trade off natively against mileage cost (~$0.55/mile × 1000).
+    reserve_pct = float(problem.min_reserve_fraction or RESERVE_PCT_DEFAULT)
+    n_late_penalized = 0
 
     # Pre-compute reward per (client, day) — done once at model-build time
     # to avoid per-callback recomputation. Shape: [n_days][n_nodes].
+    # NB: a "reward" with NEGATIVE value = penalty (cost callback does
+    # `cost -= reward` so neg reward → +cost).
     stop_rewards_by_day: List[List[int]] = []
     for d in range(n_days):
         cal_days = cal_days_to_d[d]
@@ -711,17 +766,31 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
         for i, c in enumerate(pool):
             ts = problem.initial_tanks[c.id]
             rate = float(ts.rate_lbs_per_day or 0.0)
-            if rate <= 0:
+            tank_cap = float(c.tank_capacity_lbs)
+            if rate <= 0 or tank_cap <= 0:
                 day_rewards.append(0)
                 continue
-            cur_at_d = max(0.0, float(ts.current_lbs) - cal_days * rate)
-            dte_at_d = cur_at_d / rate if rate > 0 else 999.0
-            urgency_b = _urgency_bonus_dollars(dte_at_d)
-            refill = refills_by_day[d][i + 1]
-            refill_b = REFILL_REWARD_PER_LB * refill
-            total_reward_units = int(round((urgency_b + refill_b) * COST_SCALE))
+            reserve_lbs = tank_cap * reserve_pct
+            # Project tank level at visit-day d — allow NEGATIVE values so
+            # the past-empty penalty has a slope (don't clamp to zero here).
+            raw_lbs_at_d = float(ts.current_lbs) - cal_days * rate
+            days_past_reserve = max(0.0, (reserve_lbs - raw_lbs_at_d) / rate)
+            days_past_empty   = max(0.0, (0.0         - raw_lbs_at_d) / rate)
+            penalty_dollars = (
+                RESERVE_PENALTY_PER_DAY * days_past_reserve
+                + EMPTY_PENALTY_PER_DAY * days_past_empty
+            )
+            if penalty_dollars > 0:
+                n_late_penalized += 1
+            # Negative reward → cost callback adds (positive) penalty
+            total_reward_units = int(round(-penalty_dollars * COST_SCALE))
             day_rewards.append(total_reward_units)
         stop_rewards_by_day.append(day_rewards)
+    if n_late_penalized:
+        print(f"  Reserve penalty: {n_late_penalized} (client, day) pairs "
+              f"price 'visit past reserve/empty' "
+              f"(${RESERVE_PENALTY_PER_DAY:.0f}/d past reserve, "
+              f"${EMPTY_PENALTY_PER_DAY:.0f}/d past empty)")
 
     def _make_cost_cb(_mgr, _sd, _rf, _rates, _curs, _min_stop_lbs, _mile_cost,
                       _small_fee, _stop_rewards_d):
@@ -1086,9 +1155,15 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
               f"a small top-off")
 
     # ── 5.12 Commit-window enforcement (RC-7) ────────────────────────────
-    # Lock clients with DTE ≤ commit_days+buffer into days 0..commit_days-1
-    # — UNLESS those days are forbidden for the client by operator (then
-    # use the earliest non-forbidden day in the horizon).
+    # Lock clients with days-to-RESERVE ≤ commit_days+buffer into days
+    # 0..commit_days-1 — UNLESS those days are forbidden for the client
+    # by operator (then use the earliest non-forbidden day in the
+    # horizon).
+    #
+    # NB: previously this used days-to-EMPTY (`current / rate`), so the
+    # lock fired ~1-2 days later than it should and the solver could
+    # schedule past the reserve threshold within the commit window.
+    # Now it agrees with the spreadsheet's "Next Delivery By" column.
     commit_days = problem.commit_days
     commit_horizon = commit_days + COMMIT_BUFFER_DAYS
     locked_to_commit = []
@@ -1097,7 +1172,9 @@ def build_routing_model_final(problem: ProblemInstance) -> ModelArtifacts:
         rate = float(ts.rate_lbs_per_day or 0.0)
         if rate <= 0:
             continue
-        days_supply = float(ts.current_lbs) / rate
+        tank_cap = float(c.tank_capacity_lbs)
+        reserve_lbs = tank_cap * reserve_pct
+        days_supply = max(0.0, (float(ts.current_lbs) - reserve_lbs) / rate)
         if days_supply > commit_horizon:
             continue
         forbidden_days = client_forbidden_days.get(i, set())
