@@ -93,6 +93,64 @@ def _write_input_file(path: Path) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# HEADER-BASED COLUMN LOOKUP
+# ════════════════════════════════════════════════════════════════════════════
+# The Optimizer_Input sheet's column order is operator-editable. Hardcoding
+# row[12] = "Est. Current" used to work — until someone reshuffles columns
+# and row[12] now means "Refill", and the dashboard silently displays
+# garbage (e.g. CROWNE PLAZA shows -79 lbs because we're reading the Refill
+# column instead of Est. Current). This helper scans the header row once
+# and returns {field_key: 0-based-col-index}, so column reshuffles don't
+# break us. Missing fields → key absent (caller falls back).
+
+# Header substrings we look for (lowercase, whitespace-normalized).
+# First match wins per field. Each tuple = (field_key, list of substrings).
+_COL_HEADER_MATCHERS = [
+    ('tank',         ['tank (lbs)', 'tank lbs', 'tank']),
+    ('rate',         ['avg per day cons', 'last per day cons', 'avg', 'cons']),
+    ('std_dev',      ['std dev', 'stddev', 'sigma']),
+    ('product',      ['product']),
+    ('last_delivery', ['last delivery']),
+    ('days_since',   ['days since']),
+    ('est_current',  ['est. current', 'est current', 'estimated current']),
+    ('refill',       ['refill']),
+    ('dte_sheet',    ['days until empty', 'days to empty']),
+    ('next_by',      ['next delivery by', 'next by']),
+    ('anova_level',  ['anova level']),
+    ('anova_time',   ['anova updated', 'anova timestamp']),
+    ('anova_status', ['anova status']),
+]
+
+
+def _normalize_header(s) -> str:
+    if s is None:
+        return ''
+    return str(s).lower().replace('\n', ' ').replace('\r', ' ').strip()
+
+
+def _build_column_map(ws, header_row: int = 5,
+                       max_cols: int = 30) -> Dict[str, int]:
+    """Return {field_key: 0-based-col-idx} by matching header substrings.
+
+    Scans `ws.cell(header_row, c)` for c in 1..max_cols. Returns ONLY fields
+    that match — caller should check key presence with `.get(key)`.
+    """
+    out: Dict[str, int] = {}
+    for c in range(1, max_cols + 1):
+        h = _normalize_header(ws.cell(header_row, c).value)
+        if not h:
+            continue
+        for field_key, matchers in _COL_HEADER_MATCHERS:
+            if field_key in out:
+                continue   # already matched earlier — left-most wins
+            for m in matchers:
+                if m in h:
+                    out[field_key] = c - 1   # 0-based for tuple indexing
+                    break
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # SAFE CELL PARSING
 # ════════════════════════════════════════════════════════════════════════════
 # Excel cells may contain error strings ("#VALUE!", "#REF!", "#NAME?",
@@ -195,25 +253,29 @@ def _stale_client_warnings(f: Path) -> List[Dict]:
     flagged: List[Tuple[str, str, int, int]] = []
     if 'Optimizer_Input' in wb.sheetnames:
         ws = wb['Optimizer_Input']
-        # Cols: 2=id 3=name 7=tank 8=rate 11=days_since 12=est_current
-        #       19=anova_lvl 20=anova_age
-        for row in ws.iter_rows(min_row=6, max_col=20, values_only=True):
+        col = _build_column_map(ws, header_row=5)
+        def _get(row_tuple, key):
+            idx = col.get(key)
+            if idx is None or idx >= len(row_tuple):
+                return None
+            return row_tuple[idx]
+
+        max_col = max(col.values(), default=20) + 1
+        for row in ws.iter_rows(min_row=6, max_col=max_col, values_only=True):
             if not row or row[1] is None: continue
             cid = str(row[1])
             name = str(row[2] or '')[:40]
-            # Column shifts after Std Dev added at col 9 — everything
-            # after col 8 moved +1. AVG (col 8 / idx 7) stayed put.
-            # _safe_float() makes us robust to #VALUE!/#REF! cells.
-            tank = _safe_float(row[6]) or 0
-            rate = _safe_float(row[7]) or 0           # AVG rate
-            days_since_raw = row[11] if len(row) > 11 else None
-            days_since = _safe_float(days_since_raw)
-            est_cur = _safe_float(row[12]) if len(row) > 12 else None
-            anova_lvl = row[19] if len(row) > 19 else None
-            anova_age = _safe_float(row[20]) if len(row) > 20 else None
-            anova_fresh = (anova_lvl is not None and
-                            anova_age is not None and
-                            abs(anova_age) < 48)
+            tank = _safe_float(_get(row, 'tank')) or 0
+            rate = _safe_float(_get(row, 'rate')) or 0
+            days_since = _safe_float(_get(row, 'days_since'))
+            est_cur = _safe_float(_get(row, 'est_current'))
+            anova_lvl = _get(row, 'anova_level')
+            anova_time = _get(row, 'anova_time')
+            # Fresh = Anova reading from within 48 h
+            anova_fresh = False
+            if anova_lvl is not None and isinstance(anova_time, datetime):
+                age_h = (datetime.now() - anova_time).total_seconds() / 3600.0
+                anova_fresh = abs(age_h) < 48
 
             if rate <= 0 or tank <= 0 or est_cur is None: continue
             if days_since is None: continue
@@ -366,45 +428,53 @@ def _client_list() -> List[Dict]:
 
     rows: List[Dict] = []
     ws = wb['Optimizer_Input']
-    # Column layout (operator added StdDev at col 9, shifted others +1):
-    #   col  8 / idx 7  = AVG rate
-    #   col  9 / idx 8  = Std Dev (new)
-    #   col 11 / idx 10 = Last Delivery
-    #   col 13 / idx 12 = Est. Current
-    #   col 20 / idx 19 = Anova Level
-    #   col 21 / idx 20 = Anova Age
-    for row in ws.iter_rows(min_row=6, max_col=22, values_only=True):
+    # Resolve columns by HEADER NAME — operator can reorganize freely
+    # without breaking the dashboard. Each lookup returns None when the
+    # column isn't present, so we degrade gracefully.
+    col = _build_column_map(ws, header_row=5)
+    def _get(row_tuple, key):
+        idx = col.get(key)
+        if idx is None or idx >= len(row_tuple):
+            return None
+        return row_tuple[idx]
+
+    for row in ws.iter_rows(min_row=6, max_col=max(col.values(), default=22)+1, values_only=True):
         if not row or row[1] is None:
             continue
         cid = str(row[1])
-        # Use _safe_float so #VALUE!/#REF! cells degrade to None instead of crashing.
-        spreadsheet_rate = _safe_float(row[7])               # AVG
-        spreadsheet_std = _safe_float(row[8]) if len(row) > 8 else None
-        last_deliv = row[10] if len(row) > 10 else None
-        est_cur = _safe_float(row[12]) if len(row) > 12 else None
-        anova_lvl = row[19] if len(row) > 19 else None
-        anova_age = _safe_float(row[20]) if len(row) > 20 else None
+        # Header-driven cell reads — survives column reshuffles
+        spreadsheet_rate = _safe_float(_get(row, 'rate'))
+        spreadsheet_std  = _safe_float(_get(row, 'std_dev'))
+        last_deliv       = _get(row, 'last_delivery')
+        est_cur          = _safe_float(_get(row, 'est_current'))
+        anova_lvl        = _get(row, 'anova_level')
+        anova_time       = _get(row, 'anova_time')
 
-        # Use the spreadsheet's AVG rate (which the solver also uses now).
-        # No more IQR-filtered fallback — operator-curated AVG is canonical.
+        # "anova_age_h": legacy field name on the JSON output — compute it
+        # from the timestamp if we have one (sheet exposes a timestamp now,
+        # not an age — so we derive).
+        anova_age = None
+        if isinstance(anova_time, datetime):
+            anova_age = round((datetime.now() - anova_time).total_seconds() / 3600.0, 1)
+
+        # Use the spreadsheet's curated rate (operator-tuned).
         rate = round(spreadsheet_rate, 1) if spreadsheet_rate else None
         std = round(spreadsheet_std, 1) if spreadsheet_std else None
 
         # Tank from clients tuple (master), fallback to Optimizer_Input
         client = by_id.get(cid)
-        tank_raw = _safe_float(row[6]) or 0
+        tank_raw = _safe_float(_get(row, 'tank')) or 0
         tank = float(client.tank_capacity_lbs) if client else tank_raw
         name = client.customer if client else (row[2] or '')
 
         current_lbs = est_cur or 0.0
         pct = round(100 * current_lbs / tank, 0) if tank > 0 else 0
 
-        # DTE = current / rate. Spreadsheet's DTE column (now col 15 / idx 14)
-        # is the same calc; use ours so it stays in sync if Anova adjusts current.
+        # DTE = current / rate. Falls back to sheet's DTE column if no rate.
         if rate and rate > 0:
             dte = round(current_lbs / rate, 1)
         else:
-            sheet_dte = _safe_float(row[14]) if len(row) > 14 else None
+            sheet_dte = _safe_float(_get(row, 'dte_sheet'))
             dte = round(sheet_dte, 1) if sheet_dte is not None else None
 
         rows.append({

@@ -305,18 +305,29 @@ def _iqr_filter(values: np.ndarray, factor: float = 3.0) -> np.ndarray:
 # Returns the immutable, augmented ProblemInstance.
 
 def _load_sheet_rates_and_state(input_file: Path) -> Dict[str, Dict[str, float]]:
-    """Read Optimizer_Input → per-client AVG rate, StdDev, and Est Current.
+    """Read Optimizer_Input → per-client rate, optional StdDev, Est. Current.
 
-    Schema (after operator added AVG + StdDev columns):
-      col  8 (idx 7)  = AVG Per Day Cons (lbs/day)
-      col  9 (idx 8)  = Std Dev (lbs/day)
-      col 13 (idx 12) = Est. Current (lbs)
+    Columns are looked up BY HEADER NAME (row 5), not by index, so the
+    operator can reorganize the workbook freely without breaking the
+    solver. Headers we match (case-insensitive substring):
+      • "avg per day cons" or "last per day cons"  → rate
+      • "std dev" / "stddev"                       → std_dev (optional)
+      • "est. current" / "est current"             → est_current
 
-    The operator curates AVG and StdDev directly — this is the canonical
-    source of truth, not our IQR-filtered estimator. StdDev enables
-    variance-aware safety stock if we want it later.
+    Why this matters: a previous schema had Est. Current at col M (13).
+    The current workbook moved it to col L (12) when an intermediate
+    column was removed. Indexed reads gave the solver the Refill column
+    (Tank − Est.Current), which is NEGATIVE for any tank reading over
+    its capacity (e.g. CROWNE PLAZA's Anova = 779 lbs on a 700-lb tank
+    → solver saw "current = -79" and panicked).
     """
     out: Dict[str, Dict[str, float]] = {}
+    # Header matchers, scanned against row 5. First match per field wins.
+    matchers = {
+        'rate':        ['avg per day cons', 'last per day cons', 'avg', 'cons'],
+        'std_dev':     ['std dev', 'stddev', 'sigma'],
+        'est_current': ['est. current', 'est current', 'estimated current'],
+    }
     try:
         import openpyxl as _ox
         wb = _ox.load_workbook(input_file, data_only=True, read_only=True)
@@ -324,29 +335,41 @@ def _load_sheet_rates_and_state(input_file: Path) -> Dict[str, Dict[str, float]]
             wb.close()
             return out
         ws = wb['Optimizer_Input']
-        for row in ws.iter_rows(min_row=6, max_col=14, values_only=True):
+
+        # Resolve column indices from header row 5
+        col_idx: Dict[str, int] = {}
+        for c in range(1, 26):
+            v = ws.cell(5, c).value
+            if v is None:
+                continue
+            h = str(v).lower().replace('\n', ' ').replace('\r', ' ').strip()
+            for field, subs in matchers.items():
+                if field in col_idx:
+                    continue
+                if any(s in h for s in subs):
+                    col_idx[field] = c - 1   # 0-based for tuple indexing
+
+        if not col_idx:
+            wb.close()
+            return out
+
+        max_idx = max(col_idx.values()) + 1
+        for row in ws.iter_rows(min_row=6, max_col=max(14, max_idx), values_only=True):
             if not row or row[1] is None:
                 continue
             cid = str(row[1])
             entry: Dict[str, float] = {}
-            # AVG rate (col 8 / index 7)
-            try:
-                if row[7] is not None:
-                    entry['avg_rate'] = float(row[7])
-            except (ValueError, TypeError):
-                pass
-            # StdDev (col 9 / index 8) — NEW
-            try:
-                if len(row) > 8 and row[8] is not None:
-                    entry['std_dev'] = float(row[8])
-            except (ValueError, TypeError):
-                pass
-            # Est. Current (col 13 / index 12)
-            try:
-                if len(row) > 12 and row[12] is not None:
-                    entry['est_current'] = float(row[12])
-            except (ValueError, TypeError):
-                pass
+            for field, idx in col_idx.items():
+                if idx >= len(row) or row[idx] is None:
+                    continue
+                try:
+                    entry[field] = float(row[idx])
+                except (ValueError, TypeError):
+                    pass
+            # Map internal 'rate' key back to legacy 'avg_rate' name so
+            # downstream code in build_augmented_problem doesn't change.
+            if 'rate' in entry:
+                entry['avg_rate'] = entry.pop('rate')
             if entry:
                 out[cid] = entry
         wb.close()
