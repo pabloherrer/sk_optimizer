@@ -241,7 +241,11 @@ body {
 
 .card-body { flex: 1; padding: 12px 16px; overflow: auto; min-height: 0; }
 .card-body-clients { padding: 0; }
-.card-body-trucks { padding: 8px 12px; }
+.card-body-trucks {
+  padding: 8px 12px;
+  /* Cap: ~5 day-rows visible, rest scrolls — keeps Results on screen. */
+  max-height: 185px; overflow-y: auto;
+}
 .card-body-tuning { padding: 10px 14px; }
 
 /* Solver Tuning card */

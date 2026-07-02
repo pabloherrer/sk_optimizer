@@ -166,6 +166,25 @@
       </div>
     </section>
 
+    <!-- Results (KPIs + downloads + day breakdown) — kept ABOVE Solver
+         Tuning so it is always on screen; tuning is rarely touched. -->
+    <section class="card card-plan">
+      <header class="card-header">
+        <h2>⑤ Results</h2>
+        <span class="card-header-right">
+          <button class="btn-mini-flat" id="urgency-btn" disabled
+                  title="Side-by-side view: pre-run urgency vs solver's schedule">
+            📊 Urgency Matrix
+          </button>
+          <span class="card-hint" id="plan-stamp"></span>
+        </span>
+      </header>
+      <div class="card-body" id="plan-body">
+        <div class="empty">No plan yet — click <b>▶ Run</b> (top right).
+          Results appear here: the plan workbook to download and the route map to view.</div>
+      </div>
+    </section>
+
     <!-- Solver Tuning — min fill %, etc. -->
     <section class="card card-tuning">
       <header class="card-header">
@@ -186,24 +205,6 @@
           <div class="tuning-hint" id="min-fill-pct-hint"></div>
         </div>
 
-      </div>
-    </section>
-
-    <!-- Last Plan (KPIs + downloads + day breakdown) -->
-    <section class="card card-plan">
-      <header class="card-header">
-        <h2>⑤ Results</h2>
-        <span class="card-header-right">
-          <button class="btn-mini-flat" id="urgency-btn" disabled
-                  title="Side-by-side view: pre-run urgency vs solver's schedule">
-            📊 Urgency Matrix
-          </button>
-          <span class="card-hint" id="plan-stamp"></span>
-        </span>
-      </header>
-      <div class="card-body" id="plan-body">
-        <div class="empty">No plan yet — click <b>▶ Run</b> (top right).
-          Results appear here: the plan workbook to download and the route map to view.</div>
       </div>
     </section>
 
