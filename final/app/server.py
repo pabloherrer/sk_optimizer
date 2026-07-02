@@ -61,6 +61,9 @@ app = Flask(__name__,
 # Never let the browser cache app.js / style.css — updates must show up on a
 # plain reload, not require a hard refresh (users won't know to do that).
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+# Re-read the HTML template from disk when it changes (otherwise Flask keeps
+# the version compiled at startup and page updates only appear after restart).
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 _APP_STARTED = int(time.time())
 
 # ── Run state ────────────────────────────────────────────────────────────────
