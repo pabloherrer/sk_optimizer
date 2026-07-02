@@ -123,6 +123,34 @@
   <!-- RIGHT: SIDEBAR -->
   <aside class="sidebar">
 
+    <!-- Deliveries In Progress (assumed-delivered layer) -->
+    <section class="card card-inprogress">
+      <header class="card-header">
+        <h2>Deliveries In Progress
+          <span class="tuning-help"
+                title="Deliveries dispatched (on today's route sheet) but not yet typed into the Delivery_Log. The optimizer treats each as delivered — assumed full tank — so it won't re-schedule these clients. The assumption is replaced automatically once the real delivery is logged, and expires after a few days if never logged.">ⓘ</span>
+        </h2>
+        <span class="card-header-right">
+          <button class="btn-mini-flat" id="ip-log-btn"
+                  title="Enter the pounds delivered for each stop, then copy/paste straight into the Delivery_Log sheet.">
+            📋 Log amounts
+          </button>
+          <span class="card-hint" id="ip-count">—</span>
+        </span>
+      </header>
+      <div class="card-body card-body-inprogress">
+        <div class="ip-add-row">
+          <input type="search" id="ip-search" placeholder="Add client (name or ID)…"
+                 autocomplete="off">
+          <input type="date" id="ip-date">
+        </div>
+        <div class="ip-suggestions" id="ip-suggestions" hidden></div>
+        <div class="ip-list" id="ip-list">
+          <div class="empty">None — add today's dispatched stops here.</div>
+        </div>
+      </div>
+    </section>
+
     <!-- Truck Availability -->
     <section class="card card-trucks">
       <header class="card-header">
@@ -219,6 +247,37 @@
     <div class="urgency-body" id="urgency-body">
       <div class="loading" style="padding: 20px;">Loading…</div>
     </div>
+  </div>
+</div>
+
+<!-- Log Amounts modal — enter lbs delivered per in-progress stop, then
+     copy/paste into the Delivery_Log sheet (A:B block, then D column;
+     two steps so the auto-formula in column C is never overwritten). -->
+<div class="modal-backdrop" id="ip-log-modal" hidden onclick="closeIpLogIfBackdrop(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <header class="modal-header">
+      <div>
+        <h3 style="margin: 0;">Log delivered amounts</h3>
+        <div class="modal-sub">Enter lbs delivered, then paste into the Delivery_Log
+          sheet in two steps (keeps the auto-name formula in column C intact).</div>
+      </div>
+      <button class="btn-mini-flat" onclick="closeIpLog()">Close</button>
+    </header>
+    <div class="ip-log-body" id="ip-log-body">
+      <div class="empty">No in-progress deliveries.</div>
+    </div>
+    <footer class="ip-log-footer">
+      <button class="btn-mini-flat" id="ip-copy-ab"
+              title="Copies Date + Customer # rows. In the Delivery_Log, click the first empty cell in column A and paste.">
+        1️⃣ Copy Date + Customer # (→ paste in col A)
+      </button>
+      <button class="btn-mini-flat" id="ip-copy-d"
+              title="Copies the Qty column. Click the matching first cell in column D and paste.">
+        2️⃣ Copy Qty (→ paste in col D)
+      </button>
+      <a class="btn-mini-flat" href="/api/in-progress/export.csv" download>⬇ CSV</a>
+      <span class="card-hint" id="ip-copy-status"></span>
+    </footer>
   </div>
 </div>
 

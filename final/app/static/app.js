@@ -29,6 +29,16 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#min-fill-pct').addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
   // Urgency Matrix modal
   $('#urgency-btn').addEventListener('click', openUrgencyMatrix);
+  // Deliveries In Progress card
+  $('#ip-date').value = todayISO();
+  $('#ip-search').addEventListener('input', renderIpSuggestions);
+  $('#ip-search').addEventListener('focus', renderIpSuggestions);
+  $('#ip-log-btn').addEventListener('click', openIpLog);
+  $('#ip-copy-ab').addEventListener('click', () => copyIp('ab'));
+  $('#ip-copy-d').addEventListener('click', () => copyIp('d'));
+  document.addEventListener('click', (ev) => {
+    if (!ev.target.closest('.card-inprogress')) $('#ip-suggestions').hidden = true;
+  });
   refreshAll();
 });
 
@@ -39,7 +49,183 @@ async function refreshAll() {
     refreshClients(),
     refreshTrucks(),
     refreshSolverSettings(),
+    refreshInProgress(),
   ]);
+}
+
+// ── Deliveries In Progress (assumed-delivered sidecar) ──────────────────────
+
+async function refreshInProgress() {
+  try {
+    const r = await fetch('/api/in-progress');
+    const data = await r.json();
+    STATE.inProgress = data.entries || [];
+    renderInProgress(data.expiry_days);
+  } catch (e) { /* card stays in last state */ }
+}
+
+function clientName(cid) {
+  const c = STATE.clients.find(x => x.id === cid);
+  return c ? displayName(c.name) : cid;
+}
+
+function renderInProgress(expiryDays) {
+  const list = $('#ip-list');
+  const entries = STATE.inProgress || [];
+  $('#ip-count').textContent = entries.length
+    ? `${entries.filter(e => e.status === 'active').length} active`
+    : '—';
+  if (!entries.length) {
+    list.innerHTML = '<div class="empty">None — add today\'s dispatched stops here.</div>';
+    return;
+  }
+  const hasExpired = entries.some(e => e.status === 'expired');
+  list.innerHTML = entries.map(e => {
+    const cls = e.status === 'expired' ? 'ip-row ip-expired' : 'ip-row';
+    const badge = e.status === 'expired'
+      ? `<span class="ip-badge" title="Never appeared in the Delivery_Log within ${expiryDays} days — the optimizer now IGNORES this entry. Log the real delivery or remove it.">expired</span>`
+      : '';
+    const qty = e.qty_lbs ? ` · ${Math.round(e.qty_lbs)} lbs` : '';
+    return `
+      <div class="${cls}">
+        <span class="ip-name" title="${escape(e.client_id)}">${escape(clientName(e.client_id))}</span>
+        <span class="ip-meta">${escape(e.date)}${qty}</span>
+        ${badge}
+        <button class="btn-mini-flat ip-remove" title="Remove — the optimizer will treat this client as NOT delivered"
+                onclick="removeInProgress('${escape(e.client_id)}', '${escape(e.date)}')">✕</button>
+      </div>`;
+  }).join('') + (hasExpired
+    ? `<button class="btn-mini-flat ip-clear" onclick="clearExpiredInProgress()">Clear expired</button>`
+    : '');
+}
+
+function renderIpSuggestions() {
+  const box = $('#ip-suggestions');
+  const q = $('#ip-search').value.trim().toLowerCase();
+  if (q.length < 2) { box.hidden = true; return; }
+  const existing = new Set((STATE.inProgress || []).map(e => e.client_id));
+  const matches = STATE.clients
+    .filter(c => !existing.has(c.id) &&
+                 (c.name.toLowerCase().includes(q) || c.id.toLowerCase().includes(q)))
+    .slice(0, 8);
+  if (!matches.length) { box.hidden = true; return; }
+  box.innerHTML = matches.map(c =>
+    `<div class="ip-suggestion" onclick="addInProgress('${escape(c.id)}')">
+       <b>${escape(c.id)}</b> ${escape(displayName(c.name))}
+     </div>`).join('');
+  box.hidden = false;
+}
+
+async function addInProgress(cid) {
+  $('#ip-suggestions').hidden = true;
+  $('#ip-search').value = '';
+  try {
+    const r = await fetch('/api/in-progress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', client_ids: [cid],
+                             date: $('#ip-date').value || todayISO() }),
+    });
+    if ((await r.json()).ok) refreshInProgress();
+  } catch (e) { /* leave as-is */ }
+}
+
+async function removeInProgress(cid, d) {
+  try {
+    const r = await fetch('/api/in-progress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'remove', client_id: cid, date: d }),
+    });
+    if ((await r.json()).ok) refreshInProgress();
+  } catch (e) { /* leave as-is */ }
+}
+
+async function clearExpiredInProgress() {
+  try {
+    const r = await fetch('/api/in-progress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'clear-expired' }),
+    });
+    if ((await r.json()).ok) refreshInProgress();
+  } catch (e) { /* leave as-is */ }
+}
+
+// ── Log Amounts modal (qty entry + Delivery_Log paste export) ───────────────
+
+function openIpLog() {
+  renderIpLog();
+  $('#ip-log-modal').hidden = false;
+}
+function closeIpLog() { $('#ip-log-modal').hidden = true; }
+function closeIpLogIfBackdrop(ev) {
+  if (ev.target === $('#ip-log-modal')) closeIpLog();
+}
+
+function renderIpLog() {
+  const body = $('#ip-log-body');
+  const entries = (STATE.inProgress || []).filter(e => e.status !== 'future');
+  if (!entries.length) {
+    body.innerHTML = '<div class="empty">No in-progress deliveries.</div>';
+    return;
+  }
+  body.innerHTML = `
+    <table class="ip-log-table">
+      <thead><tr><th>Date</th><th>ID</th><th>Client</th><th>Qty delivered (lbs)</th></tr></thead>
+      <tbody>
+        ${entries.map(e => `
+          <tr>
+            <td>${escape(e.date)}</td>
+            <td class="name-id">${escape(e.client_id)}</td>
+            <td class="ip-log-name">${escape(clientName(e.client_id))}</td>
+            <td><input type="number" min="0" step="1" class="ip-qty"
+                       value="${e.qty_lbs != null ? Math.round(e.qty_lbs) : ''}"
+                       placeholder="—"
+                       data-cid="${escape(e.client_id)}" data-date="${escape(e.date)}"
+                       onchange="setIpQty(this)"></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function setIpQty(input) {
+  const qty = input.value === '' ? null : parseFloat(input.value);
+  try {
+    await fetch('/api/in-progress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'set-qty', client_id: input.dataset.cid,
+                             date: input.dataset.date, qty_lbs: qty }),
+    });
+    await refreshInProgress();          // card shows the qty too
+  } catch (e) { /* leave as-is */ }
+}
+
+function ipLoggedRows() {
+  // Only rows with a qty, in Delivery_Log append order (oldest first).
+  return (STATE.inProgress || [])
+    .filter(e => e.qty_lbs != null && e.status !== 'future')
+    .sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 :
+                    a.client_id < b.client_id ? -1 : 1);
+}
+
+function fmtLogDate(iso) {           // 2026-07-02 → 07/02/2026 (Excel-friendly)
+  const [y, m, d] = iso.split('-');
+  return `${m}/${d}/${y}`;
+}
+
+async function copyIp(mode) {
+  const rows = ipLoggedRows();
+  const status = $('#ip-copy-status');
+  if (!rows.length) { status.textContent = 'No quantities entered yet.'; return; }
+  const text = rows.map(e => mode === 'ab'
+    ? `${fmtLogDate(e.date)}\t${e.client_id}`
+    : `${Math.round(e.qty_lbs)}`).join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    status.textContent = mode === 'ab'
+      ? `${rows.length} rows copied — paste at the first empty cell in column A.`
+      : `${rows.length} quantities copied — paste at the matching cell in column D.`;
+  } catch (e) {
+    status.textContent = 'Copy failed — use the CSV download instead.';
+  }
 }
 
 // ── Solver Tuning ─────────────────────────────────────────────────────────

@@ -1,0 +1,95 @@
+{
+  "entries": [
+    {
+      "client_id": "12050",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:33:14.145198"
+    },
+    {
+      "client_id": "1001",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:33:19.119508"
+    },
+    {
+      "client_id": "6077",
+      "date": "2026-07-02",
+      "qty_lbs": 200.0,
+      "note": "",
+      "created_at": "2026-07-02T11:33:25.987063"
+    },
+    {
+      "client_id": "7002",
+      "date": "2026-07-02",
+      "qty_lbs": 300.0,
+      "note": "",
+      "created_at": "2026-07-02T11:33:36.968701"
+    },
+    {
+      "client_id": "15027",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:33:42.760697"
+    },
+    {
+      "client_id": "2073",
+      "date": "2026-07-02",
+      "qty_lbs": 400.0,
+      "note": "",
+      "created_at": "2026-07-02T11:33:48.735628"
+    },
+    {
+      "client_id": "16027",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:33:57.251961"
+    },
+    {
+      "client_id": "2045",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:03.041368"
+    },
+    {
+      "client_id": "15015",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:11.302710"
+    },
+    {
+      "client_id": "18054",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:29.136443"
+    },
+    {
+      "client_id": "18001",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:36.643623"
+    },
+    {
+      "client_id": "20088",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:45.760147"
+    },
+    {
+      "client_id": "1081",
+      "date": "2026-07-02",
+      "qty_lbs": null,
+      "note": "",
+      "created_at": "2026-07-02T11:34:54.926997"
+    }
+  ]
+}

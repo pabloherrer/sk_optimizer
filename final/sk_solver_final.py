@@ -525,6 +525,34 @@ def build_augmented_problem(
         print(f"  ⚠ Ignored {n_sheet_bad} spreadsheet est_current values that were "
               f"out-of-range (negative or > tank capacity)")
 
+    # IN-PROGRESS / ASSUMED DELIVERIES (sidecar) — deliveries dispatched on
+    # the manual route sheet (shadow mode) or committed by a prior run (live)
+    # that are NOT yet in the Delivery_Log. Without this, those clients look
+    # empty and get re-dispatched. Applied AFTER the spreadsheet est_current
+    # alignment so 'assumed' outranks the sheet's stale formula level; the
+    # alignment above only touches source=='estimated' so it can never
+    # overwrite an assumed tank on later runs either.
+    # Reconciliation rules documented in final/app/in_progress_store.py.
+    in_progress_file = (
+        Path(__file__).resolve().parent.parent / 'data' / 'in_progress.json'
+    )
+    if in_progress_file.exists():
+        from final.app.in_progress_store import (
+            apply_assumed_deliveries, load_in_progress,
+        )
+        ip_entries = load_in_progress(in_progress_file)
+        if ip_entries:
+            manual_ids = frozenset(r.client_id for r in base.overrides.readings)
+            updated_tanks, ip_log = apply_assumed_deliveries(
+                initial_tanks=updated_tanks,
+                tank_cap_by_id=tank_cap_by_id,
+                entries=ip_entries,
+                manual_reading_ids=manual_ids,
+                plan_today=today,
+            )
+            for line in ip_log:
+                print(line)
+
     # SHIFT CONFIGURATION — operator-confirmed truth (overrides the Depot sheet)
     #
     # The Depot sheet shows Shift_End_HHMM=14:00, which made

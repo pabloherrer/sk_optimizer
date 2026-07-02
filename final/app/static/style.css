@@ -721,3 +721,67 @@ body {
   background: #ECEFF3; border-top: 1px solid var(--border);
   font-size: 11px; color: var(--text-faint);
 }
+
+/* ── Deliveries In Progress card ─────────────────────────────────────────── */
+.card-body-inprogress { padding: 10px 14px 12px; }
+.ip-add-row { display: flex; gap: 6px; margin-bottom: 8px; }
+.ip-add-row input[type="search"] {
+  flex: 1; min-width: 0; padding: 5px 8px; font-size: 12px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+}
+.ip-add-row input[type="date"] {
+  padding: 4px 6px; font-size: 11px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  color: var(--text-soft);
+}
+.ip-suggestions {
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  background: var(--card); margin-bottom: 8px;
+  max-height: 180px; overflow-y: auto;
+  box-shadow: 0 4px 10px rgba(0,0,0,.08);
+}
+.ip-suggestion {
+  padding: 6px 10px; font-size: 12px; cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.ip-suggestion:last-child { border-bottom: none; }
+.ip-suggestion:hover { background: var(--bg); }
+.ip-suggestion b { color: var(--text-faint); font-weight: 500; margin-right: 4px; }
+.ip-list { display: flex; flex-direction: column; gap: 4px; }
+.ip-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 6px; border-radius: 6px; font-size: 12px;
+  background: var(--bg);
+}
+.ip-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ip-meta { color: var(--text-faint); font-size: 11px; white-space: nowrap; }
+.ip-badge {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  color: var(--danger); border: 1px solid var(--danger);
+  border-radius: 4px; padding: 0 4px;
+}
+.ip-expired { opacity: .65; }
+.ip-remove { padding: 0 6px; color: var(--text-faint); }
+.ip-remove:hover { color: var(--danger); }
+.ip-clear { margin-top: 6px; align-self: flex-end; }
+
+/* ── Log Amounts modal ───────────────────────────────────────────────────── */
+.ip-log-body { padding: 8px 16px; max-height: 50vh; overflow-y: auto; }
+.ip-log-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ip-log-table th {
+  text-align: left; font-size: 10px; text-transform: uppercase;
+  color: var(--text-faint); padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--border-strong);
+}
+.ip-log-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border); }
+.ip-log-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ip-qty {
+  width: 90px; padding: 4px 6px; font-size: 12px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+}
+.ip-qty:focus { border-color: var(--sk-green, #1A8F4C); outline: none; }
+.ip-log-footer {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 10px 16px; border-top: 1px solid var(--border);
+}
+.ip-log-footer a { text-decoration: none; }

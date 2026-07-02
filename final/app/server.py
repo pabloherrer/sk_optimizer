@@ -51,6 +51,7 @@ DATA_DIR = REPO / 'data'
 OUTPUT_DIR = REPO / 'final' / 'output'
 USER_OVERRIDES = DATA_DIR / 'user_overrides.json'
 TRUCK_UNAVAIL = DATA_DIR / 'truck_unavailable.json'
+IN_PROGRESS = DATA_DIR / 'in_progress.json'
 LOCAL_CONFIG = REPO / 'local_config.json'
 
 # ── Flask app ────────────────────────────────────────────────────────────────
@@ -972,6 +973,135 @@ def api_overrides_post():
         })
     save_user_overrides(USER_OVERRIDES, pins, forbids)
     return jsonify({'ok': True, 'pins': pins, 'forbids': forbids})
+
+
+@app.route('/api/in-progress', methods=['GET'])
+def api_in_progress_get():
+    """
+    List in-progress / assumed deliveries with freshness status.
+
+    Status is computed against TODAY (wall clock) — informational only;
+    the solver applies its own rules against the requested plan date
+    (see final/app/in_progress_store.py).
+    """
+    from final.app.in_progress_store import EXPIRY_DAYS, load_in_progress
+    entries = load_in_progress(IN_PROGRESS)
+    today = date.today()
+    out = []
+    for e in sorted(entries, key=lambda x: (x.date, x.client_id), reverse=True):
+        age = (today - e.date).days
+        out.append({
+            'client_id': e.client_id,
+            'date': e.date.isoformat(),
+            'qty_lbs': e.qty_lbs,
+            'note': e.note,
+            'age_days': age,
+            'status': ('expired' if age > EXPIRY_DAYS
+                       else 'future' if age < 0 else 'active'),
+        })
+    return jsonify({'entries': out, 'expiry_days': EXPIRY_DAYS})
+
+
+@app.route('/api/in-progress', methods=['POST'])
+def api_in_progress_post():
+    """
+    Mutate the in-progress list.
+      {action: 'add',    client_ids: [...], date: 'YYYY-MM-DD', qty_lbs?, note?}
+      {action: 'remove', client_id: '...',  date: 'YYYY-MM-DD'}
+      {action: 'clear-expired'}
+    """
+    from final.app.in_progress_store import (
+        EXPIRY_DAYS, load_in_progress, save_in_progress,
+    )
+    body = request.get_json(force=True) or {}
+    action = body.get('action')
+    if action not in ('add', 'remove', 'clear-expired', 'set-qty'):
+        return jsonify({'ok': False, 'error': 'bad action'}), 400
+
+    entries = [
+        {'client_id': e.client_id, 'date': e.date.isoformat(),
+         'qty_lbs': e.qty_lbs, 'note': e.note,
+         'created_at': (e.created_at.isoformat() if e.created_at else None)}
+        for e in load_in_progress(IN_PROGRESS)
+    ]
+
+    if action == 'add':
+        d_str = str(body.get('date', '')).strip()
+        try:
+            d = date.fromisoformat(d_str)
+        except ValueError:
+            return jsonify({'ok': False, 'error': 'bad date'}), 400
+        cids = [str(c).strip() for c in body.get('client_ids', []) if str(c).strip()]
+        if not cids:
+            return jsonify({'ok': False, 'error': 'no clients'}), 400
+        qty = body.get('qty_lbs')
+        try:
+            qty = float(qty) if qty not in (None, '') else None
+        except (TypeError, ValueError):
+            qty = None
+        note = str(body.get('note', ''))
+        # De-dupe: one entry per (client, date) — re-add replaces.
+        keep = [e for e in entries
+                if not (e['client_id'] in cids and e['date'] == d.isoformat())]
+        for cid in cids:
+            keep.append({'client_id': cid, 'date': d.isoformat(),
+                         'qty_lbs': qty, 'note': note,
+                         'created_at': datetime.now().isoformat()})
+        entries = keep
+
+    elif action == 'remove':
+        cid = str(body.get('client_id', '')).strip()
+        d_str = str(body.get('date', '')).strip()
+        entries = [e for e in entries
+                   if not (e['client_id'] == cid and e['date'] == d_str)]
+
+    elif action == 'set-qty':
+        # Record the actual pounds delivered for one entry. Feeds both the
+        # partial-fill assumption logic and the Delivery_Log export.
+        cid = str(body.get('client_id', '')).strip()
+        d_str = str(body.get('date', '')).strip()
+        qty = body.get('qty_lbs')
+        try:
+            qty = float(qty) if qty not in (None, '') else None
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'bad qty'}), 400
+        for e in entries:
+            if e['client_id'] == cid and e['date'] == d_str:
+                e['qty_lbs'] = qty
+
+    elif action == 'clear-expired':
+        today = date.today()
+        def _fresh(e):
+            try:
+                return (today - date.fromisoformat(e['date'])).days <= EXPIRY_DAYS
+            except ValueError:
+                return False
+        entries = [e for e in entries if _fresh(e)]
+
+    save_in_progress(IN_PROGRESS, entries)
+    return jsonify({'ok': True, 'count': len(entries)})
+
+
+@app.route('/api/in-progress/export.csv')
+def api_in_progress_export():
+    """
+    CSV of logged deliveries in Delivery_Log entry order:
+    Date, Customer #, Qty Delivered (lbs). Only rows with a quantity.
+    Columns C and E-K of the Delivery_Log auto-calculate — the office
+    pastes/enters only A, B, D.
+    """
+    from final.app.in_progress_store import load_in_progress
+    rows = ['Date,Customer #,Qty Delivered (lbs)']
+    for e in sorted(load_in_progress(IN_PROGRESS), key=lambda x: (x.date, x.client_id)):
+        if e.qty_lbs is None:
+            continue
+        qty = int(e.qty_lbs) if float(e.qty_lbs).is_integer() else e.qty_lbs
+        rows.append(f'{e.date.strftime("%m/%d/%Y")},{e.client_id},{qty}')
+    csv = '\n'.join(rows) + '\n'
+    return app.response_class(
+        csv, mimetype='text/csv',
+        headers={'Content-Disposition':
+                 f'attachment; filename=delivery_log_{date.today().isoformat()}.csv'})
 
 
 @app.route('/api/truck-availability', methods=['GET'])
