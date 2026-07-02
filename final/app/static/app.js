@@ -29,17 +29,21 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#min-fill-pct').addEventListener('change', onMinFillSliderCommit);   // fires on mouseup
   // Urgency Matrix modal
   $('#urgency-btn').addEventListener('click', openUrgencyMatrix);
-  // Deliveries In Progress card
-  $('#ip-date').value = todayISO();
-  $('#ip-search').addEventListener('input', renderIpSuggestions);
-  $('#ip-search').addEventListener('focus', renderIpSuggestions);
-  $('#ip-log-btn').addEventListener('click', openIpLog);
-  $('#ip-copy-ab').addEventListener('click', () => copyIp('ab'));
-  $('#ip-copy-d').addEventListener('click', () => copyIp('d'));
-  $('#ip-log-search').addEventListener('input', ipLogSearchInput);
-  $('#ip-log-search').addEventListener('keydown', ipLogSearchKeydown);
+  // Deliveries In Progress card — null-safe bindings: if the served HTML
+  // is older than this script (stale template / browser cache), skip the
+  // card quietly instead of crashing the whole dashboard load.
+  const bind = (id, evt, fn) => { const el = $(id); if (el) el.addEventListener(evt, fn); };
+  if ($('#ip-date')) $('#ip-date').value = todayISO();
+  bind('#ip-search', 'input', renderIpSuggestions);
+  bind('#ip-search', 'focus', renderIpSuggestions);
+  bind('#ip-log-btn', 'click', openIpLog);
+  bind('#ip-copy-ab', 'click', () => copyIp('ab'));
+  bind('#ip-copy-d', 'click', () => copyIp('d'));
+  bind('#ip-log-search', 'input', ipLogSearchInput);
+  bind('#ip-log-search', 'keydown', ipLogSearchKeydown);
   document.addEventListener('click', (ev) => {
-    if (!ev.target.closest('.card-inprogress')) $('#ip-suggestions').hidden = true;
+    const sug = $('#ip-suggestions');
+    if (sug && !ev.target.closest('.card-inprogress')) sug.hidden = true;
   });
   refreshAll();
 });
@@ -58,6 +62,7 @@ async function refreshAll() {
 // ── Deliveries In Progress (assumed-delivered sidecar) ──────────────────────
 
 async function refreshInProgress() {
+  if (!$('#ip-list')) return;              // card not in served HTML — skip
   try {
     const r = await fetch('/api/in-progress');
     const data = await r.json();
