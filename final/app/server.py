@@ -58,6 +58,10 @@ LOCAL_CONFIG = REPO / 'local_config.json'
 app = Flask(__name__,
              template_folder=str(APP_DIR / 'templates'),
              static_folder=str(APP_DIR / 'static'))
+# Never let the browser cache app.js / style.css — updates must show up on a
+# plain reload, not require a hard refresh (users won't know to do that).
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+_APP_STARTED = int(time.time())
 
 # ── Run state ────────────────────────────────────────────────────────────────
 _run_lock = threading.Lock()
@@ -296,10 +300,14 @@ def _stale_client_warnings(f: Path) -> List[Dict]:
             'count': len(flagged),
             'sample': flagged[:10],
             'message': (
-                f'{len(flagged)} client(s) show as nearly empty with last delivery '
-                f'>14 days ago and no Anova sensor. The estimate may be wrong '
-                f'(missing delivery in log). Verify before dispatching. '
-                f'Sample: {sample}{more}'
+                f'⚠ Check before running: {len(flagged)} client(s) have no recent '
+                f'delivery in the Delivery_Log, so the system thinks their tank is '
+                f'empty — probably a delivery was never typed into the log. '
+                f'What to do: if they WERE delivered recently, add that delivery to '
+                f'the Delivery_Log sheet (or to "Deliveries In Progress" if it was '
+                f'in the last day or two). If they really have not been served in '
+                f'months, no action needed. '
+                f'Clients (days since last logged delivery): {sample}{more}'
             ),
         })
     return warnings
@@ -629,7 +637,10 @@ def _upcoming_workdays(start: date, count: int = 10) -> List[date]:
 @app.route('/')
 def index():
     default_date = (date.today() + timedelta(days=1)).isoformat()
-    return render_template('index.html', default_date=default_date)
+    # Cache-buster: server start time appended to static URLs, so every app
+    # restart guarantees fresh JS/CSS even for browsers that cached old copies.
+    return render_template('index.html', default_date=default_date,
+                           v=_APP_STARTED)
 
 
 # ════════════════════════════════════════════════════════════════════════════

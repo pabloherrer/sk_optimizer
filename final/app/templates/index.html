@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>S&amp;K Route Dispatch</title>
   <link rel="icon" type="image/png" href="/static/sk-logo.png">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ v }}">
 </head>
 <body>
 
@@ -64,10 +64,14 @@
 <section class="horizon-banner">
   <span class="banner-icon">📅</span>
   <span class="banner-text">
-    <b>How this works:</b>
-    The optimizer plans <b><span id="horizon-days">10</span> working days</b> ahead.
-    The first <b><span id="commit-days">2</span> days are firm</b> (dispatch these now).
-    The rest is a <b>preview</b> — it will be re-solved when you re-run tomorrow.
+    <b>Daily routine:</b>
+    <b>①</b> Fix any yellow warnings above &nbsp;→&nbsp;
+    <b>②</b> Enter today's dispatched stops in <b>Deliveries In Progress</b> &nbsp;→&nbsp;
+    <b>③</b> Check <b>Trucks Available</b> &nbsp;→&nbsp;
+    <b>④</b> Click <b>▶ Run</b> (top right) &nbsp;→&nbsp;
+    <b>⑤</b> Get the plan in <b>Results</b>: Excel to download, map to view.
+    The first <b><span id="commit-days">2</span> days are firm</b> — dispatch those;
+    the remaining <b><span id="horizon-days">10</span>-day</b> preview re-solves tomorrow.
   </span>
 </section>
 
@@ -126,7 +130,7 @@
     <!-- Deliveries In Progress (assumed-delivered layer) -->
     <section class="card card-inprogress">
       <header class="card-header">
-        <h2>Deliveries In Progress
+        <h2>② Deliveries In Progress
           <span class="tuning-help"
                 title="Deliveries dispatched (on today's route sheet) but not yet typed into the Delivery_Log. The optimizer treats each as delivered — assumed full tank — so it won't re-schedule these clients. The assumption is replaced automatically once the real delivery is logged, and expires after a few days if never logged.">ⓘ</span>
         </h2>
@@ -154,7 +158,7 @@
     <!-- Truck Availability -->
     <section class="card card-trucks">
       <header class="card-header">
-        <h2>Trucks Available</h2>
+        <h2>③ Trucks Available</h2>
         <span class="card-hint">Click to toggle off-days</span>
       </header>
       <div class="card-body card-body-trucks" id="trucks-body">
@@ -166,7 +170,7 @@
     <section class="card card-tuning">
       <header class="card-header">
         <h2>Solver Tuning</h2>
-        <span class="card-hint">Takes effect on next Run</span>
+        <span class="card-hint">optional · takes effect on next Run</span>
       </header>
       <div class="card-body card-body-tuning">
         <div class="tuning-row">
@@ -188,7 +192,7 @@
     <!-- Last Plan (KPIs + downloads + day breakdown) -->
     <section class="card card-plan">
       <header class="card-header">
-        <h2>Last Plan</h2>
+        <h2>⑤ Results</h2>
         <span class="card-header-right">
           <button class="btn-mini-flat" id="urgency-btn" disabled
                   title="Side-by-side view: pre-run urgency vs solver's schedule">
@@ -198,7 +202,8 @@
         </span>
       </header>
       <div class="card-body" id="plan-body">
-        <div class="empty">No plan yet — click <b>Run</b> to build one.</div>
+        <div class="empty">No plan yet — click <b>▶ Run</b> (top right).
+          Results appear here: the plan workbook to download and the route map to view.</div>
       </div>
     </section>
 
@@ -285,6 +290,6 @@
   </div>
 </div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v={{ v }}"></script>
 </body>
 </html>

@@ -169,15 +169,38 @@ def load_deliveries(input_file: Path) -> pd.DataFrame:
             id_to_name[cid] = str(r[1]).strip()
 
     ws = wb['Delivery_Log']
+
+    # ── Resolve columns BY HEADER NAME (row 3), not by fixed position. ──────
+    # The office occasionally inserts/moves columns in the shared workbook;
+    # a July 2026 insert shifted Qty from D to E and silently blinded the
+    # solver to ALL deliveries. Header-based lookup makes any such shift
+    # harmless. Falls back to the legacy positions if headers are absent.
+    def _hdr_key(v) -> str:
+        return ' '.join(str(v or '').lower().split())
+    col_date, col_cust, col_qty, col_tank = 0, 1, 3, 7        # legacy fallback
+    header_cells = next(ws.iter_rows(min_row=3, max_row=3, values_only=True), ())
+    for idx, h in enumerate(header_cells):
+        k = _hdr_key(h)
+        if not k:
+            continue
+        if k.startswith('date'):
+            col_date = idx
+        elif k.startswith('customer #') or k == 'customer number':
+            col_cust = idx
+        elif k.startswith('qty'):
+            col_qty = idx
+        elif k.startswith('tank'):
+            col_tank = idx
+
     records: list[dict] = []
     for row in ws.iter_rows(min_row=4, values_only=True):
-        if not row or row[0] is None:
+        if not row or row[col_date] is None:
             continue
-        qty = row[3] if len(row) > 3 else None
+        qty = row[col_qty] if len(row) > col_qty else None
         if not isinstance(qty, (int, float)) or qty <= 0:
             continue
 
-        raw_date = row[0]
+        raw_date = row[col_date]
         try:
             d = pd.Timestamp(
                 raw_date.date() if hasattr(raw_date, 'date') else raw_date
@@ -187,14 +210,14 @@ def load_deliveries(input_file: Path) -> pd.DataFrame:
         if pd.isna(d):
             continue
 
-        if len(row) < 2 or row[1] is None:
+        if len(row) <= col_cust or row[col_cust] is None:
             continue
-        cid = _normalize_id(row[1])
+        cid = _normalize_id(row[col_cust])
         if not cid:
             continue
         customer = id_to_name.get(cid, cid)
 
-        tank_lbs = _to_float(row[7]) if len(row) > 7 else None
+        tank_lbs = _to_float(row[col_tank]) if len(row) > col_tank else None
 
         records.append({
             'Date':           d,
