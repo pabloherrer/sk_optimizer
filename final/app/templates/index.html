@@ -75,10 +75,94 @@
   </span>
 </section>
 
-<!-- ═══════════════════════════════ MAIN GRID ═══════════════════════════════ -->
+<!-- ═══════════════════════════════ MAIN LAYOUT ═══════════════════════════════
+     One normal page flow, ONE scrollbar (the browser's).
+     Row 1: workflow strip — ② In Progress · ③ Trucks (+ tuning) · ⑤ Results.
+     Row 2: Clients table, full width, natural height.                        -->
 <main class="dashboard">
 
-  <!-- LEFT: CLIENT BROWSER (dominant) -->
+  <!-- ROW 1: WORKFLOW STRIP -->
+  <div class="workflow-strip">
+
+    <!-- Deliveries In Progress (assumed-delivered layer) -->
+    <section class="card card-inprogress">
+      <header class="card-header">
+        <h2>② Deliveries In Progress
+          <span class="tuning-help"
+                title="Deliveries dispatched (on today's route sheet) but not yet typed into the Delivery_Log. The optimizer treats each as delivered — assumed full tank — so it won't re-schedule these clients. The assumption is replaced automatically once the real delivery is logged, and expires after a few days if never logged.">ⓘ</span>
+        </h2>
+        <span class="card-header-right">
+          <button class="btn-mini-flat" id="ip-log-btn"
+                  title="Enter the pounds delivered for each stop, then copy/paste straight into the Delivery_Log sheet.">
+            📋 Log amounts
+          </button>
+          <span class="card-hint" id="ip-count">—</span>
+        </span>
+      </header>
+      <div class="card-body card-body-inprogress">
+        <div class="ip-add-row">
+          <input type="search" id="ip-search" placeholder="Add client (name or ID)…"
+                 autocomplete="off">
+          <input type="date" id="ip-date">
+        </div>
+        <div class="ip-suggestions" id="ip-suggestions" hidden></div>
+        <div class="ip-list" id="ip-list">
+          <div class="empty">None — add today's dispatched stops here.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Truck Availability + Solver Tuning (small section, same card) -->
+    <section class="card card-trucks">
+      <header class="card-header">
+        <h2>③ Trucks Available</h2>
+        <span class="card-hint">Click to toggle off-days</span>
+      </header>
+      <div class="card-body card-body-trucks" id="trucks-body">
+        <div class="loading">Loading…</div>
+      </div>
+      <!-- Solver Tuning — folded into the trucks card as a footer section -->
+      <div class="card-body card-body-tuning tuning-section">
+        <div class="tuning-section-head">
+          <span class="tuning-section-title">Solver Tuning</span>
+          <span class="card-hint">optional · takes effect on next Run</span>
+        </div>
+        <div class="tuning-row">
+          <label for="min-fill-pct">
+            Minimum fill %
+            <span class="tuning-help"
+                  title="Skip a stop if the planned delivery would be less than this % of tank capacity. A 1000-lb tank getting a 400-lb top-off (40%) would be skipped at 50%, but kept at 30%. Urgent clients (DTE ≤ 3 days) bypass this rule.">ⓘ</span>
+          </label>
+          <div class="tuning-control">
+            <input type="range" id="min-fill-pct" min="0" max="80" step="5">
+            <span class="tuning-value" id="min-fill-pct-val">—</span>
+          </div>
+          <div class="tuning-hint" id="min-fill-pct-hint"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Results (KPIs + downloads + day breakdown) -->
+    <section class="card card-plan">
+      <header class="card-header">
+        <h2>⑤ Results</h2>
+        <span class="card-header-right">
+          <button class="btn-mini-flat" id="urgency-btn" disabled
+                  title="Side-by-side view: pre-run urgency vs solver's schedule">
+            📊 Urgency Matrix
+          </button>
+          <span class="card-hint" id="plan-stamp"></span>
+        </span>
+      </header>
+      <div class="card-body" id="plan-body">
+        <div class="empty">No plan yet — click <b>▶ Run</b> (top right).
+          Results appear here: the plan workbook to download and the route map to view.</div>
+      </div>
+    </section>
+
+  </div><!-- /workflow-strip -->
+
+  <!-- ROW 2: CLIENT BROWSER — full width, natural height (page scrolls) -->
   <section class="card card-clients">
     <header class="card-header">
       <h2>Clients</h2>
@@ -123,92 +207,6 @@
       </div>
     </div>
   </section>
-
-  <!-- RIGHT: SIDEBAR -->
-  <aside class="sidebar">
-
-    <!-- Deliveries In Progress (assumed-delivered layer) -->
-    <section class="card card-inprogress">
-      <header class="card-header">
-        <h2>② Deliveries In Progress
-          <span class="tuning-help"
-                title="Deliveries dispatched (on today's route sheet) but not yet typed into the Delivery_Log. The optimizer treats each as delivered — assumed full tank — so it won't re-schedule these clients. The assumption is replaced automatically once the real delivery is logged, and expires after a few days if never logged.">ⓘ</span>
-        </h2>
-        <span class="card-header-right">
-          <button class="btn-mini-flat" id="ip-log-btn"
-                  title="Enter the pounds delivered for each stop, then copy/paste straight into the Delivery_Log sheet.">
-            📋 Log amounts
-          </button>
-          <span class="card-hint" id="ip-count">—</span>
-        </span>
-      </header>
-      <div class="card-body card-body-inprogress">
-        <div class="ip-add-row">
-          <input type="search" id="ip-search" placeholder="Add client (name or ID)…"
-                 autocomplete="off">
-          <input type="date" id="ip-date">
-        </div>
-        <div class="ip-suggestions" id="ip-suggestions" hidden></div>
-        <div class="ip-list" id="ip-list">
-          <div class="empty">None — add today's dispatched stops here.</div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Truck Availability -->
-    <section class="card card-trucks">
-      <header class="card-header">
-        <h2>③ Trucks Available</h2>
-        <span class="card-hint">Click to toggle off-days</span>
-      </header>
-      <div class="card-body card-body-trucks" id="trucks-body">
-        <div class="loading">Loading…</div>
-      </div>
-    </section>
-
-    <!-- Results (KPIs + downloads + day breakdown) — kept ABOVE Solver
-         Tuning so it is always on screen; tuning is rarely touched. -->
-    <section class="card card-plan">
-      <header class="card-header">
-        <h2>⑤ Results</h2>
-        <span class="card-header-right">
-          <button class="btn-mini-flat" id="urgency-btn" disabled
-                  title="Side-by-side view: pre-run urgency vs solver's schedule">
-            📊 Urgency Matrix
-          </button>
-          <span class="card-hint" id="plan-stamp"></span>
-        </span>
-      </header>
-      <div class="card-body" id="plan-body">
-        <div class="empty">No plan yet — click <b>▶ Run</b> (top right).
-          Results appear here: the plan workbook to download and the route map to view.</div>
-      </div>
-    </section>
-
-    <!-- Solver Tuning — min fill %, etc. -->
-    <section class="card card-tuning">
-      <header class="card-header">
-        <h2>Solver Tuning</h2>
-        <span class="card-hint">optional · takes effect on next Run</span>
-      </header>
-      <div class="card-body card-body-tuning">
-        <div class="tuning-row">
-          <label for="min-fill-pct">
-            Minimum fill %
-            <span class="tuning-help"
-                  title="Skip a stop if the planned delivery would be less than this % of tank capacity. A 1000-lb tank getting a 400-lb top-off (40%) would be skipped at 50%, but kept at 30%. Urgent clients (DTE ≤ 3 days) bypass this rule.">ⓘ</span>
-          </label>
-          <div class="tuning-control">
-            <input type="range" id="min-fill-pct" min="0" max="80" step="5">
-            <span class="tuning-value" id="min-fill-pct-val">—</span>
-          </div>
-          <div class="tuning-hint" id="min-fill-pct-hint"></div>
-        </div>
-
-      </div>
-    </section>
-
-  </aside>
 
 </main>
 
