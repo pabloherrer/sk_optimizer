@@ -785,3 +785,13 @@ body {
   padding: 10px 16px; border-top: 1px solid var(--border);
 }
 .ip-log-footer a { text-decoration: none; }
+
+/* ── Log Amounts: search + progress ─────────────────────────────────────── */
+.ip-log-search-row { padding: 10px 16px 0; }
+.ip-log-search-row input {
+  width: 100%; padding: 6px 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+}
+.ip-log-progress { font-size: 11px; color: var(--text-faint); padding: 6px 0; }
+.ip-log-done td { opacity: .55; }
+.ip-log-done .ip-qty { opacity: 1; background: #EAF6EF; }

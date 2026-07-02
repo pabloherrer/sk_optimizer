@@ -36,6 +36,8 @@ window.addEventListener('DOMContentLoaded', () => {
   $('#ip-log-btn').addEventListener('click', openIpLog);
   $('#ip-copy-ab').addEventListener('click', () => copyIp('ab'));
   $('#ip-copy-d').addEventListener('click', () => copyIp('d'));
+  $('#ip-log-search').addEventListener('input', ipLogSearchInput);
+  $('#ip-log-search').addEventListener('keydown', ipLogSearchKeydown);
   document.addEventListener('click', (ev) => {
     if (!ev.target.closest('.card-inprogress')) $('#ip-suggestions').hidden = true;
   });
@@ -152,27 +154,49 @@ async function clearExpiredInProgress() {
 // ── Log Amounts modal (qty entry + Delivery_Log paste export) ───────────────
 
 function openIpLog() {
+  $('#ip-log-search').value = '';
   renderIpLog();
   $('#ip-log-modal').hidden = false;
+  setTimeout(() => $('#ip-log-search').focus(), 50);
 }
 function closeIpLog() { $('#ip-log-modal').hidden = true; }
 function closeIpLogIfBackdrop(ev) {
   if (ev.target === $('#ip-log-modal')) closeIpLog();
 }
 
+function ipLogVisibleEntries() {
+  const q = ($('#ip-log-search').value || '').trim().toLowerCase();
+  let entries = (STATE.inProgress || []).filter(e => e.status !== 'future');
+  if (q) {
+    entries = entries.filter(e =>
+      e.client_id.toLowerCase().includes(q) ||
+      clientName(e.client_id).toLowerCase().includes(q));
+  }
+  // Unfilled amounts first — they're the ones being worked through.
+  return entries.sort((a, b) =>
+    (a.qty_lbs == null ? 0 : 1) - (b.qty_lbs == null ? 0 : 1));
+}
+
 function renderIpLog() {
   const body = $('#ip-log-body');
-  const entries = (STATE.inProgress || []).filter(e => e.status !== 'future');
-  if (!entries.length) {
+  const entries = ipLogVisibleEntries();
+  const all = (STATE.inProgress || []).filter(e => e.status !== 'future');
+  const done = all.filter(e => e.qty_lbs != null).length;
+  if (!all.length) {
     body.innerHTML = '<div class="empty">No in-progress deliveries.</div>';
     return;
   }
+  if (!entries.length) {
+    body.innerHTML = '<div class="empty">No match — check spelling or clear the search.</div>';
+    return;
+  }
   body.innerHTML = `
+    <div class="ip-log-progress">${done} of ${all.length} amounts entered</div>
     <table class="ip-log-table">
       <thead><tr><th>Date</th><th>ID</th><th>Client</th><th>Qty delivered (lbs)</th></tr></thead>
       <tbody>
         ${entries.map(e => `
-          <tr>
+          <tr class="${e.qty_lbs != null ? 'ip-log-done' : ''}">
             <td>${escape(e.date)}</td>
             <td class="name-id">${escape(e.client_id)}</td>
             <td class="ip-log-name">${escape(clientName(e.client_id))}</td>
@@ -180,10 +204,32 @@ function renderIpLog() {
                        value="${e.qty_lbs != null ? Math.round(e.qty_lbs) : ''}"
                        placeholder="—"
                        data-cid="${escape(e.client_id)}" data-date="${escape(e.date)}"
-                       onchange="setIpQty(this)"></td>
+                       onchange="setIpQty(this)"
+                       onkeydown="ipQtyKeydown(event, this)"></td>
           </tr>`).join('')}
       </tbody>
     </table>`;
+}
+
+// Search box: typing filters; Enter jumps to the first visible amount field.
+function ipLogSearchInput() { renderIpLog(); }
+function ipLogSearchKeydown(ev) {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  const first = $('#ip-log-body').querySelector('.ip-qty');
+  if (first) { first.focus(); first.select(); }
+}
+
+// Amount field: Enter saves, then returns to the search box (cleared) so the
+// next customer can be typed immediately — same rhythm as adding stops.
+async function ipQtyKeydown(ev, input) {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  await setIpQty(input);
+  const search = $('#ip-log-search');
+  search.value = '';
+  renderIpLog();
+  search.focus();
 }
 
 async function setIpQty(input) {
