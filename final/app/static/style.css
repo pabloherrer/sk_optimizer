@@ -28,18 +28,18 @@
 
 * { box-sizing: border-box; }
 
+/* ── LAYOUT PHILOSOPHY (redesigned 2026-07-02) ──────────────────────────────
+   The page is a NORMAL SCROLLING WEBPAGE. Nothing is ever hidden because it
+   "doesn't fit": if content grows, the page grows and you scroll. The only
+   pinned elements are the top bar (Run button always reachable) and the
+   right sidebar (sticky, with its own scroll if it's taller than the
+   window). Must be fully usable at 100% zoom on a laptop. ────────────────── */
 html, body {
-  margin: 0; padding: 0; height: 100%;
+  margin: 0; padding: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
   font-size: 14px;
   color: var(--text);
   background: var(--bg);
-  overflow: hidden;
-}
-
-body {
-  display: grid;
-  grid-template-rows: 60px auto 44px 38px 1fr 26px;
 }
 
 /* Warning banner — hidden by default, shown when freshness checks fire */
@@ -68,11 +68,15 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  height: 60px;
   padding: 0 20px;
   background: linear-gradient(180deg, #FFFFFF, #F8FAFB);
   border-bottom: 1px solid var(--border);
   box-shadow: var(--shadow-sm);
-  z-index: 10;
+  /* Pinned: date picker, Run button and status stay reachable while
+     scrolling anywhere in the page. */
+  position: sticky; top: 0;
+  z-index: 100;
 }
 .top-bar-left { display: flex; align-items: center; gap: 14px; }
 .logo { width: 44px; height: 44px; }
@@ -124,7 +128,8 @@ body {
   justify-content: space-between;
   align-items: center;
   gap: 16px;
-  padding: 0 20px;
+  min-height: 44px;
+  padding: 4px 20px;
   background: white;
   border-bottom: 1px solid var(--border);
   font-size: 12px;
@@ -185,7 +190,8 @@ body {
 
 .horizon-banner {
   display: flex; align-items: center; gap: 10px;
-  padding: 0 20px;
+  min-height: 38px;
+  padding: 6px 20px;
   background: linear-gradient(90deg, #F4FAF0, #FFFBE5);
   border-bottom: 1px solid var(--border);
   font-size: 12px; color: var(--text-soft);
@@ -198,18 +204,25 @@ body {
 
 .dashboard {
   display: grid;
-  grid-template-columns: 1.6fr 1fr;
+  grid-template-columns: minmax(0, 1.55fr) minmax(360px, 1fr);
   gap: 14px;
   padding: 14px;
-  min-height: 0;
-  overflow: hidden;
+  align-items: start;      /* columns size to their own content */
+}
+@media (max-width: 1100px) {
+  /* Narrow window: stack into one column instead of squeezing. */
+  .dashboard { grid-template-columns: 1fr; }
+  .sidebar { position: static !important; max-height: none !important; }
 }
 
 .sidebar {
   display: flex; flex-direction: column; gap: 14px;
-  /* overflow-y auto (was hidden): if cards outgrow the column, the sidebar
-     scrolls — cards can never be silently clipped out of view again. */
-  min-height: 0; overflow-y: auto; overflow-x: hidden;
+  /* Sticky beside the client list: stays in view while the page scrolls.
+     If the cards together are taller than the window, the sidebar gets its
+     own scrollbar — content is never clipped. */
+  position: sticky; top: 74px;
+  max-height: calc(100vh - 88px);
+  overflow-y: auto; overflow-x: hidden;
 }
 
 .card {
@@ -222,10 +235,18 @@ body {
   min-height: 0;
 }
 
+/* Client list: its own scroll region sized to the window, so the sidebar
+   stays alongside; the page itself can still scroll if anything overflows. */
 .card-clients { min-height: 0; }
-.card-trucks  { flex: 0 0 auto; max-height: 36%; }
+.card-clients .card-body-clients {
+  max-height: calc(100vh - 250px);
+  min-height: 320px;
+  overflow-y: auto;
+}
+.card-trucks  { flex: 0 0 auto; }
 .card-tuning  { flex: 0 0 auto; }
-.card-plan    { flex: 1; min-height: 0; }
+.card-plan    { flex: 0 0 auto; }
+.card-plan .card-body { max-height: 46vh; overflow-y: auto; }
 
 .card-header {
   display: flex; justify-content: space-between; align-items: baseline;
@@ -693,7 +714,7 @@ body {
   position: fixed; inset: 0;
   background: rgba(20, 30, 50, 0.45);
   display: flex; align-items: center; justify-content: center;
-  z-index: 100;
+  z-index: 300;   /* above the sticky top bar (100) */
 }
 .modal {
   background: white; border-radius: var(--radius);
@@ -723,7 +744,8 @@ body {
 
 .bottom-bar {
   display: flex; justify-content: space-between; align-items: center;
-  padding: 0 20px;
+  min-height: 26px;
+  padding: 4px 20px;
   background: #ECEFF3; border-top: 1px solid var(--border);
   font-size: 11px; color: var(--text-faint);
 }
