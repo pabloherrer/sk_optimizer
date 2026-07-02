@@ -207,7 +207,9 @@ body {
 
 .sidebar {
   display: flex; flex-direction: column; gap: 14px;
-  min-height: 0; overflow: hidden;
+  /* overflow-y auto (was hidden): if cards outgrow the column, the sidebar
+     scrolls — cards can never be silently clipped out of view again. */
+  min-height: 0; overflow-y: auto; overflow-x: hidden;
 }
 
 .card {
@@ -747,7 +749,12 @@ body {
 .ip-suggestion:last-child { border-bottom: none; }
 .ip-suggestion:hover { background: var(--bg); }
 .ip-suggestion b { color: var(--text-faint); font-weight: 500; margin-right: 4px; }
-.ip-list { display: flex; flex-direction: column; gap: 4px; }
+.ip-list {
+  display: flex; flex-direction: column; gap: 4px;
+  /* Cap the card so a long day of stops scrolls inside it instead of
+     pushing Last Plan / Trucks / Tuning out of the sidebar. */
+  max-height: 168px; overflow-y: auto;
+}
 .ip-row {
   display: flex; align-items: center; gap: 8px;
   padding: 4px 6px; border-radius: 6px; font-size: 12px;
