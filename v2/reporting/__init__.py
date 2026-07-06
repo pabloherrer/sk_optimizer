@@ -37,6 +37,7 @@ def write_all_outputs(
     invariant_results: Optional[List[Tuple[str, bool, str]]] = None,
     shift_start_min: int = 360,
     problem=None,
+    anova_ids=None,
 ) -> Dict[str, object]:
     """Write the full operator artifact set under `output_dir`.
 
@@ -56,7 +57,7 @@ def write_all_outputs(
     excel_path = output_dir / f'plan_{today_str}.xlsx'
     write_plan_excel(plan, excel_path,
                      invariant_results=invariant_results,
-                     problem=problem)
+                     problem=problem, anova_ids=anova_ids)
 
     map_path = output_dir / f'route_map_{today_str}.html'
     write_route_map(plan, map_path,

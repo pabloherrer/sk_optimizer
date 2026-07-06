@@ -1364,6 +1364,28 @@ def _make_config_proxy(problem: ProblemInstance):
 # SECTION 7. MAIN ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════
 
+def _read_anova_ids(input_file) -> set:
+    """Client IDs that have a live Anova sensor reading, from the workbook's
+    Anova_Live sheet (column B = client_id, column E = display_value). Used to
+    stamp an 'Anova' Yes/No column on the driver route sheets. Best-effort —
+    returns an empty set if the sheet is missing or unreadable."""
+    ids: set = set()
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(input_file, data_only=True, read_only=True)
+        if 'Anova_Live' in wb.sheetnames:
+            ws = wb['Anova_Live']
+            for row in ws.iter_rows(min_row=2, max_col=5, values_only=True):
+                cid = row[1] if len(row) > 1 else None       # client_id
+                val = row[4] if len(row) > 4 else None        # display_value
+                if cid is not None and val not in (None, ''):
+                    ids.add(str(cid).strip())
+        wb.close()
+    except Exception as e:
+        print(f"  (anova flag: could not read Anova_Live — {e})")
+    return ids
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI: builds problem, solves with the FINAL model, writes outputs."""
     import argparse
@@ -1465,7 +1487,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     plan = solve_final(problem, solve_seconds=args.solve_seconds)
 
     print(f"\n[3/4] Writing outputs to {output_dir}")
-    outputs = write_all_outputs(plan, output_dir, problem=problem)
+    anova_ids = _read_anova_ids(input_file)
+    print(f"  Anova sensors: {len(anova_ids)} client(s) flagged on route sheets")
+    outputs = write_all_outputs(plan, output_dir, problem=problem, anova_ids=anova_ids)
     for name, path in outputs.items():
         if isinstance(path, list):
             for p in path:

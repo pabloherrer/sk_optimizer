@@ -581,11 +581,11 @@ def _build_deferred(ws: Worksheet, plan, problem=None) -> None:
 PRINT_HEADERS = [
     'Stop#', 'Customer', 'Address', 'Phone', 'ETA',
     'Dist (mi)', 'Refill Lbs', 'Tank Cap', 'Tank Before',
-    'Tank After', 'Fill %', 'DTE', 'Notes',
+    'Tank After', 'Fill %', 'DTE', 'Anova', 'Notes',
 ]
 PRINT_COL_WIDTHS = {
     1: 6, 2: 30, 3: 30, 4: 14, 5: 9, 6: 8, 7: 10,
-    8: 9, 9: 11, 10: 11, 11: 7, 12: 6, 13: 24,
+    8: 9, 9: 11, 10: 11, 11: 7, 12: 6, 13: 7, 14: 24,
 }
 
 
@@ -833,6 +833,7 @@ def _build_print_day(
     d: date,
     phones: Dict[str, str],
     problem=None,
+    anova_ids=None,
 ) -> None:
     """Driver-friendly per-day printable. Landscape. Stockout block at bottom."""
     ws.title = f'PRINT {d.strftime("%a %b %d")}'[:31]
@@ -857,6 +858,7 @@ def _build_print_day(
 
     shift_start = _shift_start_min(plan)
     routes = _routes_on(plan, d)
+    anova_ids = {str(c) for c in (anova_ids or set())}   # client_ids with a live Anova sensor
     row = 1
     if not routes:
         cell = ws.cell(row=1, column=1, value=(
@@ -882,7 +884,7 @@ def _build_print_day(
         cell.font = Font(bold=True, color='FFFFFF', size=14)
         cell.fill = PatternFill('solid', fgColor=_safe_truck_color(route.truck_id))
         cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
-        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=13)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=14)
         ws.row_dimensions[row].height = 28
         row += 1
 
@@ -901,7 +903,7 @@ def _build_print_day(
             cell.font = Font(size=11, bold=True)
             cell.fill = PatternFill('solid', fgColor='ECF0F1')
             cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
-            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=13)
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=14)
             ws.row_dimensions[row].height = 20
             row += 1
 
@@ -927,17 +929,18 @@ def _build_print_day(
                 round(stop.level_after_lbs),
                 round(fill, 1),
                 round(stop.days_until_stockout_at_arrival, 1),
+                'Yes' if str(stop.client_id) in anova_ids else 'No',
                 stop.notes or '',
             ]
             for i, v in enumerate(vals):
                 c = ws.cell(row=row, column=i + 1, value=v)
                 c.border = BORDER
                 c.font = Font(size=11)
-                left_align_cols = (2, 3, 13)
+                left_align_cols = (2, 3, 14)
                 c.alignment = Alignment(
                     horizontal='left' if (i + 1) in left_align_cols else 'center',
                     vertical='center',
-                    wrap_text=(i + 1) in (2, 3, 13),
+                    wrap_text=(i + 1) in (2, 3, 14),
                 )
             ws.cell(row=row, column=1).font = Font(bold=True, size=14)
             ws.cell(row=row, column=2).font = Font(bold=True, size=12)
@@ -966,14 +969,14 @@ def _build_print_day(
     row += 2
     sig_cell = ws.cell(row=row, column=1, value='Driver signature: ____________________________________________     Date: ____________')
     sig_cell.font = Font(size=11, italic=True)
-    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=13)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=14)
 
     # Column widths
     for col, w in PRINT_COL_WIDTHS.items():
         ws.column_dimensions[get_column_letter(col)].width = w
 
     # Print area covers everything written
-    ws.print_area = f'A1:{get_column_letter(13)}{row}'
+    ws.print_area = f'A1:{get_column_letter(14)}{row}'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1040,6 +1043,7 @@ def write_plan_excel(
     output_path: Path,
     invariant_results: Optional[List[Tuple[str, bool, str]]] = None,
     problem=None,
+    anova_ids=None,
 ) -> None:
     """Render `plan` to a multi-sheet Excel workbook at `output_path`.
 
@@ -1072,7 +1076,8 @@ def write_plan_excel(
         d for (d, _) in plan.routes.keys() if d in commit_set
     })
     for d in days_with_routes:
-        _build_print_day(wb.create_sheet(), plan, d, phones, problem=problem)
+        _build_print_day(wb.create_sheet(), plan, d, phones, problem=problem,
+                         anova_ids=anova_ids)
 
     _build_diagnostics(wb.create_sheet(), plan, invariant_results)
 
