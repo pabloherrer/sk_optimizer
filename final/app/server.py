@@ -1249,8 +1249,12 @@ def _ensure_matrix_up_to_date(input_file: Optional[Path]) -> bool:
             missing_ids = [c.id for c in routable]
             _append_log(f'   [matrix] file missing — will build {len(missing_ids)} clients')
         else:
-            data = np.load(matrix_file, allow_pickle=True)
-            ids_in_matrix = set(data['client_ids'])
+            # Close the .npz handle immediately. On Windows, holding it open
+            # while the build_matrix subprocess tries to os.replace() the same
+            # file raises WinError 5 (Access denied); POSIX allows it, so the
+            # leak only breaks Windows. Use a context manager.
+            with np.load(matrix_file, allow_pickle=True) as data:
+                ids_in_matrix = set(data['client_ids'])
             missing_ids = [c.id for c in routable if c.id not in ids_in_matrix]
 
         if not missing_ids:

@@ -103,8 +103,11 @@ def main(argv=None):
 
     # Decide whether to rebuild
     if matrix_file.exists() and not args.force:
-        data = np.load(matrix_file, allow_pickle=True)
-        ids_in_matrix = set(data['client_ids'])
+        # Close the .npz handle before the atomic replace below. On Windows an
+        # open file cannot be os.replace()'d (WinError 5); POSIX allows it, so
+        # leaking the handle only breaks Windows. Use a context manager.
+        with np.load(matrix_file, allow_pickle=True) as data:
+            ids_in_matrix = set(data['client_ids'])
         missing = [c for c in routable if c.id not in ids_in_matrix]
         if not missing:
             print('  ✓ Matrix is up to date. Use --force to rebuild anyway.')
